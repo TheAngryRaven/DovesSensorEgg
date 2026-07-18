@@ -80,6 +80,27 @@ uint32_t pairUntil = 0;       // millis deadline; 0 = pairing window closed
 
 float c2f(float c) { return c * 9.0f / 5.0f + 32.0f; }
 
+// -------------------------------------------------- I2C bus clear
+// A reset mid-transaction (e.g. reflashing while the MCP was being read)
+// can leave a slave driving SDA low - the address scan still half-works
+// but register reads fail. Standard recovery: clock SCL 9 times with SDA
+// released, then issue a STOP. Must run BEFORE Wire.begin().
+void i2cBusClear() {
+  pinMode(SDA, INPUT_PULLUP);
+  pinMode(SCL, OUTPUT);
+  for (int i = 0; i < 9; i++) {
+    digitalWrite(SCL, LOW);  delayMicroseconds(10);
+    digitalWrite(SCL, HIGH); delayMicroseconds(10);
+  }
+  // STOP condition: SDA low->high while SCL high.
+  pinMode(SDA, OUTPUT);
+  digitalWrite(SDA, LOW);  delayMicroseconds(10);
+  digitalWrite(SCL, HIGH); delayMicroseconds(10);
+  digitalWrite(SDA, HIGH); delayMicroseconds(10);
+  pinMode(SDA, INPUT_PULLUP);
+  pinMode(SCL, INPUT_PULLUP);
+}
+
 // -------------------------------------------------- I2C bus scan
 void scanBus() {
   Serial.println("\n--- I2C scan ---");
@@ -301,8 +322,13 @@ void setup() {
 
   Serial.println("\nDovesSensorEgg - wireless EGT pod (PW-ADV-1)");
 
+  i2cBusClear();               // recover a slave wedged by a mid-read reset
   Wire.begin();
-  Wire.setClock(400000);
+  // 100 kHz, not 400: the MCP9600's I2C tops out at 100 kHz per datasheet
+  // (it also clock-stretches). 400 kHz ACKs the address scan but the
+  // multi-byte register reads - begin()'s device-ID check first - are
+  // marginal and fail intermittently. The OLED doesn't care.
+  Wire.setClock(100000);
   delay(100);
   scanBus();
 
@@ -331,8 +357,31 @@ void setup() {
     delay(2000);
   }
 
-  if (!mcpAddr)          fatal("MCP not on bus");
-  if (!mcp.begin(mcpAddr)) fatal("MCP begin() fail");
+  if (!mcpAddr) fatal("MCP not on bus");
+
+  // begin() = the device-ID read at reg 0x20 (expects 0x40/0x41 in the
+  // high byte). Retry a few times - the MCP9600 is slow to wake and can
+  // need a moment after a bus clear - and dump the raw ID on failure so
+  // a bad read is distinguishable from a wrong/absent chip.
+  bool mcpOK = false;
+  for (int attempt = 1; attempt <= 5 && !mcpOK; attempt++) {
+    mcpOK = mcp.begin(mcpAddr);
+    if (!mcpOK) {
+      Serial.print("MCP begin() attempt "); Serial.print(attempt);
+      Serial.print(" failed, ID reg 0x20 = 0x");
+      Wire.beginTransmission(mcpAddr);
+      Wire.write(0x20);
+      Wire.endTransmission(false);
+      if (Wire.requestFrom(mcpAddr, (uint8_t)2) == 2) {
+        Serial.print(Wire.read(), HEX); Serial.print(" 0x");
+        Serial.println(Wire.read(), HEX);
+      } else {
+        Serial.println("<read failed>");
+      }
+      delay(200);
+    }
+  }
+  if (!mcpOK) fatal("MCP begin() fail");
 
   mcp.setThermocoupleType(MCP9600_TYPE_K);
   mcp.setADCresolution(MCP9600_ADCRESOLUTION_16);   // 80ms. NOT the 18-bit default.
