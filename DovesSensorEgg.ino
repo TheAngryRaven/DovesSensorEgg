@@ -1,19 +1,32 @@
 /* ==========================================================================
-   PerchWerks EGT Pod - BENCH BRINGUP  (no BLE)
+   DovesSensorEgg - wireless EGT pod (PW-ADV-1 broadcaster)
    XIAO nRF52840 + Adafruit MCP9600 + I2C OLED + button
 
-   Boot -> scan I2C -> border test -> live temp on screen + serial
-   Button on D1 toggles C / F
+   Boot -> scan I2C -> border test -> BLE up (MAC shown) -> live temp on
+   screen + serial + BLE advertising.
+
+   BLE: pure BROADCASTER. EGT + cold junction are packed into a 14-byte
+   Manufacturer Specific Data AD structure ("PW-ADV-1") and advertised at
+   ~10 Hz under the name "PWEGT". The egg never accepts a connection; the
+   DovesDataLogger receives the broadcasts with a passive scan. nRF
+   Connect on a phone doubles as a live hex debugger (mfg data starts
+   FF FF 50 57, bytes 12-13 increment).
+
+   Button on D1: short press toggles C / F on the debug screen; long
+   press (>1 s) opens a 30 s pairing window (advertises flags bit0 -
+   informational, the logger pairs by MAC/magic).
 
    Libraries (Arduino Library Manager):
      Adafruit MCP9600
      Adafruit SH110X          (or Adafruit SSD1306 if you flip USE_SH1106 to 0)
      Adafruit GFX Library     <- must be current; SH110X needs Adafruit_GrayOLED
      Adafruit BusIO
+     Bluefruit nRF52 (built into the Seeed XIAO nRF52840 board package)
    ========================================================================== */
 
 #include <Wire.h>
 #include <Adafruit_MCP9600.h>
+#include <bluefruit.h>
 
 // ---- SCREEN DRIVER: flip this if the boot border test looks wrong ----------
 #define USE_SH1106   0        // 1 = SH1106 (1.3")    0 = SSD1306 (0.96")
@@ -36,9 +49,23 @@
 #endif
 
 #define BTN_PIN     D1
-#define READ_MS    100        // MCP @16-bit converts in 80ms
+#define READ_MS    100        // MCP @16-bit converts in 80ms; also the adv rebuild tick
 #define DRAW_MS    200
 #define SERIAL_MS  250
+
+#define BTN_LONG_MS   1000    // long press -> pairing window
+#define PAIR_WINDOW_MS 30000  // flags bit0 stays set this long
+
+// ---- PW-ADV-1 payload (14 bytes, little-endian fields) --------------------
+// Bluefruit's addManufacturerData() passes the buffer through RAW - it does
+// NOT prepend a company ID - so bytes 0-1 of this array ARE the company ID
+// and the logger indexes the array identically. Layout:
+//   0-1  company ID FF FF     2-3  magic 'P' 'W'      4  proto version 01
+//   5    flags (bit0 pairing, bit1 TC fault)
+//   6-7  EGT int16 deci-degC  8-9  CJ int16 deci-degC
+//   10   raw MCP9600 STATUS   11   battery stub FF    12-13 sequence
+#define ADV_PAYLOAD_LEN 14
+#define ADV_PROTO_VER   0x01
 
 Adafruit_MCP9600 mcp;
 
@@ -47,6 +74,9 @@ uint8_t  oledAddr = 0;
 bool     oledOK   = false;
 bool     showF    = true;
 uint32_t nRead    = 0;
+
+uint16_t advSeq    = 0;
+uint32_t pairUntil = 0;       // millis deadline; 0 = pairing window closed
 
 float c2f(float c) { return c * 9.0f / 5.0f + 32.0f; }
 
@@ -84,15 +114,115 @@ uint8_t mcpStatus() {
 }
 
 // -------------------------------------------------- debounced button
-bool btnPressed() {
-  static bool     prev  = true;      // INPUT_PULLUP: idle HIGH
-  static uint32_t tLast = 0;
+// Short press (release < BTN_LONG_MS) -> 1. Long press fires 2 ONCE while
+// still held at the threshold; the eventual release is then swallowed.
+uint8_t btnEvent() {
+  static bool     prev      = true;   // INPUT_PULLUP: idle HIGH
+  static uint32_t tLast     = 0;
+  static uint32_t tDown     = 0;
+  static bool     longFired = false;
+
   bool now = digitalRead(BTN_PIN);
-  if (now == prev) return false;
-  if (millis() - tLast < 40) return false;
+
+  if (now == prev) {
+    // Held down past the threshold -> long press, once.
+    if (now == LOW && !longFired && millis() - tDown >= BTN_LONG_MS) {
+      longFired = true;
+      return 2;
+    }
+    return 0;
+  }
+  if (millis() - tLast < 40) return 0;   // debounce the edge
   tLast = millis();
   prev  = now;
-  return (now == LOW);               // fire on press
+
+  if (now == LOW) {                      // press edge
+    tDown     = millis();
+    longFired = false;
+    return 0;
+  }
+  return longFired ? 0 : 1;              // release edge -> short press
+}
+
+// -------------------------------------------------- PW-ADV-1 encode
+// 0x8000 (INT16_MIN) = "no valid reading". Emit the sentinel instead of
+// casting NaN / out-of-range floats to int16_t - that cast is undefined
+// behavior and produces plausible-looking garbage.
+int16_t encodeDeciC(float c) {
+  if (isnan(c) || c < -270.0f || c > 1400.0f) return INT16_MIN;
+  return (int16_t)lroundf(c * 10.0f);
+}
+
+void buildAdvPayload(uint8_t out[ADV_PAYLOAD_LEN], float egtC, float cjC,
+                     uint8_t st) {
+  uint8_t flags = 0;
+  if (millis() < pairUntil) flags |= 0x01;   // pairing window active
+  if (st & 0x10)            flags |= 0x02;   // MCP input-range = TC fault
+
+  int16_t egt = encodeDeciC(egtC);
+  int16_t cj  = encodeDeciC(cjC);
+
+  out[0]  = 0xFF; out[1] = 0xFF;             // company ID (SIG test/internal)
+  out[2]  = 'P';  out[3] = 'W';              // magic
+  out[4]  = ADV_PROTO_VER;
+  out[5]  = flags;
+  out[6]  = (uint8_t)(egt & 0xFF);
+  out[7]  = (uint8_t)((egt >> 8) & 0xFF);
+  out[8]  = (uint8_t)(cj & 0xFF);
+  out[9]  = (uint8_t)((cj >> 8) & 0xFF);
+  out[10] = st;
+  out[11] = 0xFF;                            // battery: stub
+  out[12] = (uint8_t)(advSeq & 0xFF);
+  out[13] = (uint8_t)((advSeq >> 8) & 0xFF);
+}
+
+// Rebuild the advertising data with fresh sensor values. stop -> clear ->
+// rebuild -> start is ugly and correct: Bluefruit has no supported
+// in-place advertising-data mutation path. Do not invent one.
+void updateAdvertising(float egtC, float cjC, uint8_t st) {
+  uint8_t payload[ADV_PAYLOAD_LEN];
+  advSeq++;                                  // one increment per adv update
+  buildAdvPayload(payload, egtC, cjC, st);
+
+  Bluefruit.Advertising.stop();
+  Bluefruit.Advertising.clearData();
+  Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
+  Bluefruit.Advertising.addManufacturerData(payload, ADV_PAYLOAD_LEN);
+  Bluefruit.Advertising.addName();           // "PWEGT" - keeps nRF Connect useful
+  Bluefruit.Advertising.start(0);            // 0 = advertise forever
+}
+
+// -------------------------------------------------- BLE bringup
+void bleSetup() {
+  Bluefruit.begin();
+  Bluefruit.setTxPower(4);
+  Bluefruit.setName("PWEGT");
+
+  // Nothing ever connects to the egg. If this line fails to compile on
+  // the installed core version, delete it and move on.
+  Bluefruit.Advertising.setType(BLE_GAP_ADV_TYPE_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED);
+
+  Bluefruit.Advertising.setInterval(160, 160);  // 100 ms (0.625 ms units)
+  Bluefruit.Advertising.setFastTimeout(0);      // never drop to the slow interval
+
+  // Print our MAC (human order, MSB first) so it can be copied into the
+  // logger's SENSOREGG_MAC #define for strict pairing.
+  uint8_t mac[6];
+  Bluefruit.getAddr(mac);                       // returns LSB first
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
+  Serial.print("BLE up, MAC "); Serial.println(macStr);
+
+  if (oledOK) {
+    oled.clearDisplay();
+    oled.setTextSize(1); oled.setTextColor(PX_ON, PX_OFF);
+    oled.setCursor(0, 0);  oled.print("BLE: PWEGT");
+    oled.setCursor(0, 18); oled.print("MAC (for logger):");
+    oled.setCursor(0, 32); oled.print(macStr);
+    oled.display();
+    delay(3000);
+  }
 }
 
 // -------------------------------------------------- fatal halt
@@ -156,7 +286,8 @@ void drawScreen(float egtC, float cjC, uint8_t st) {
   if (st < 0x10) oled.print("0");
   oled.print(st, HEX);
   if (st & 0x10) oled.print(" OPEN?");
-  else         { oled.print("  n"); oled.print(nRead); }
+  oled.print(" #"); oled.print(advSeq);         // adv sequence counter
+  if (millis() < pairUntil) oled.print(" PAIR");
 
   oled.display();
 }
@@ -168,7 +299,7 @@ void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000) { }     // don't block forever on battery
 
-  Serial.println("\nPerchWerks EGT pod - bench bringup");
+  Serial.println("\nDovesSensorEgg - wireless EGT pod (PW-ADV-1)");
 
   Wire.begin();
   Wire.setClock(400000);
@@ -209,7 +340,10 @@ void setup() {
   mcp.enable(true);
 
   Serial.print("MCP9600 up @0x"); Serial.println(mcpAddr, HEX);
-  Serial.println("D1 = C/F toggle\n");
+
+  bleSetup();
+
+  Serial.println("D1 short = C/F toggle, long = pairing window\n");
 }
 
 // -------------------------------------------------- loop
@@ -218,10 +352,15 @@ void loop() {
   static float    egtC = NAN, cjC = NAN;
   static uint8_t  st = 0;
 
-  if (btnPressed()) {
+  uint8_t btn = btnEvent();
+  if (btn == 1) {
     showF = !showF;
     Serial.print("unit -> "); Serial.println(showF ? "F" : "C");
     tDraw = 0;                                   // repaint immediately
+  } else if (btn == 2) {
+    pairUntil = millis() + PAIR_WINDOW_MS;
+    Serial.println("pairing window open (30 s)");
+    tDraw = 0;
   }
 
   if (millis() - tRead >= READ_MS) {
@@ -230,6 +369,7 @@ void loop() {
     cjC   = mcp.readAmbient();
     st    = mcpStatus();
     nRead++;
+    updateAdvertising(egtC, cjC, st);            // fresh payload every tick
   }
 
   if (millis() - tDraw >= DRAW_MS) {
