@@ -49,9 +49,20 @@
 #endif
 
 #define BTN_PIN     D1
-#define READ_MS    100        // MCP @16-bit converts in 80ms; also the adv rebuild tick
+#define READ_MS    100        // MCP @16-bit converts in 80ms
+#define ADV_MS     250        // payload rebuild tick (see ADV_INTERVAL_UNITS)
 #define DRAW_MS    200
 #define SERIAL_MS  250
+
+// Advertising interval: 179 x 0.625 ms = 111.875 ms — DELIBERATELY not the
+// spec's 100 ms. The logger scans on a 100 ms cycle with a 60 ms window;
+// equal periods phase-lock, and when the egg's packets parked in the deaf
+// 40 ms the logger lost it for seconds at a time (first bench soak). An
+// off-100 interval sweeps the phase through the window continuously, so
+// the worst-case blind stretch is bounded at ~1 s instead of unbounded.
+// Rebuilding the payload every ADV_MS (not every READ_MS) lets this
+// SoftDevice interval - not our loop tick - govern when packets air.
+#define ADV_INTERVAL_UNITS 179
 
 #define BTN_LONG_MS   1000    // long press -> pairing window
 #define PAIR_WINDOW_MS 30000  // flags bit0 stays set this long
@@ -77,6 +88,8 @@ uint32_t nRead    = 0;
 
 uint16_t advSeq    = 0;
 uint32_t pairUntil = 0;       // millis deadline; 0 = pairing window closed
+bool     advOK     = false;   // last Advertising.start() result
+uint32_t advFails  = 0;       // consecutive-rebuild failure count (debug)
 
 float c2f(float c) { return c * 9.0f / 5.0f + 32.0f; }
 
@@ -200,6 +213,10 @@ void buildAdvPayload(uint8_t out[ADV_PAYLOAD_LEN], float egtC, float cjC,
 // Rebuild the advertising data with fresh sensor values. stop -> clear ->
 // rebuild -> start is ugly and correct: Bluefruit has no supported
 // in-place advertising-data mutation path. Do not invent one.
+// start()'s result is tracked: a failed restart leaves the radio silent
+// until the next tick, and a RUN of failures is the one egg-side fault
+// that looks exactly like a dead egg to the logger - so it's surfaced on
+// the debug screen ("ADV!") and serial instead of being swallowed.
 void updateAdvertising(float egtC, float cjC, uint8_t st) {
   uint8_t payload[ADV_PAYLOAD_LEN];
   advSeq++;                                  // one increment per adv update
@@ -210,7 +227,11 @@ void updateAdvertising(float egtC, float cjC, uint8_t st) {
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
   Bluefruit.Advertising.addManufacturerData(payload, ADV_PAYLOAD_LEN);
   Bluefruit.Advertising.addName();           // "PWEGT" - keeps nRF Connect useful
-  Bluefruit.Advertising.start(0);            // 0 = advertise forever
+  advOK = Bluefruit.Advertising.start(0);    // 0 = advertise forever
+  if (!advOK) {
+    advFails++;
+    Serial.print("ADV restart failed, count "); Serial.println(advFails);
+  }
 }
 
 // -------------------------------------------------- BLE bringup
@@ -223,7 +244,7 @@ void bleSetup() {
   // the installed core version, delete it and move on.
   Bluefruit.Advertising.setType(BLE_GAP_ADV_TYPE_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED);
 
-  Bluefruit.Advertising.setInterval(160, 160);  // 100 ms (0.625 ms units)
+  Bluefruit.Advertising.setInterval(ADV_INTERVAL_UNITS, ADV_INTERVAL_UNITS);
   Bluefruit.Advertising.setFastTimeout(0);      // never drop to the slow interval
 
   // Print our MAC (human order, MSB first) so it can be copied into the
@@ -308,7 +329,8 @@ void drawScreen(float egtC, float cjC, uint8_t st) {
   oled.print(st, HEX);
   if (st & 0x10) oled.print(" OPEN?");
   oled.print(" #"); oled.print(advSeq);         // adv sequence counter
-  if (millis() < pairUntil) oled.print(" PAIR");
+  if (!advOK)               oled.print(" ADV!"); // last adv restart failed
+  else if (millis() < pairUntil) oled.print(" PAIR");
 
   oled.display();
 }
@@ -397,7 +419,7 @@ void setup() {
 
 // -------------------------------------------------- loop
 void loop() {
-  static uint32_t tRead = 0, tDraw = 0, tSer = 0;
+  static uint32_t tRead = 0, tAdv = 0, tDraw = 0, tSer = 0;
   static float    egtC = NAN, cjC = NAN;
   static uint8_t  st = 0;
 
@@ -418,7 +440,16 @@ void loop() {
     cjC   = mcp.readAmbient();
     st    = mcpStatus();
     nRead++;
-    updateAdvertising(egtC, cjC, st);            // fresh payload every tick
+  }
+
+  // Payload rebuild on its own slower tick, so between rebuilds the
+  // SoftDevice advertises autonomously at ADV_INTERVAL_UNITS - the
+  // de-aliasing interval, not our loop cadence, controls the airtime.
+  // ~4 Hz payload refresh is still far inside the probe's thermal
+  // bandwidth (time constant 0.5-3 s).
+  if (millis() - tAdv >= ADV_MS) {
+    tAdv = millis();
+    updateAdvertising(egtC, cjC, st);
   }
 
   if (millis() - tDraw >= DRAW_MS) {

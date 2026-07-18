@@ -12,10 +12,14 @@ shows live temps for bench debugging.
 
 ## Protocol — PW-ADV-1
 
-Manufacturer Specific Data, 14 bytes, advertised at ~10 Hz under the
-name `PWEGT` (multi-byte fields little-endian). The company ID is
-*inside* the array — Bluefruit passes the buffer through raw on both
-sides:
+Manufacturer Specific Data, 14 bytes, advertised under the name `PWEGT`
+(multi-byte fields little-endian). Advertising interval is **111.875 ms
+— deliberately not 100 ms**: the logger scans on a 100 ms cycle, and
+equal periods phase-lock so the egg can park in the scanner's deaf zone
+for seconds; an off-100 interval sweeps the phase instead. The payload
+(and sequence counter) refresh every 250 ms — still far inside a K-type
+probe's 0.5–3 s thermal time constant. The company ID is *inside* the
+array — Bluefruit passes the buffer through raw on both sides:
 
 | Byte | Field |
 |---|---|
