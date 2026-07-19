@@ -59,6 +59,14 @@ I2C addresses are auto-detected at boot (`0x3C/0x3D` OLED,
 - **Short press** — toggle °C/°F on the debug screen.
 - **Long press (>1 s)** — open a 30 s pairing window (sets flags bit0;
   informational — the logger pairs by MAC or payload magic).
+- **Hold 10 s** — deep sleep (nRF52 System OFF, ~µA: radio silent, MCP9600
+  in shutdown, display off — the enclosure has no power switch). A
+  countdown appears on-screen from ~2 s into the hold.
+- **Hold 5 s to wake** — the press wakes the chip, but boot drops straight
+  back to sleep unless the button stays held for 5 s. Nothing is drawn
+  during the gate, so a pocket bump never lights the screen or drains the
+  battery. (A watchdog reboot skips the gate — after a hang the pod comes
+  back broadcasting on its own.)
 
 The egg prints its MAC on serial and the OLED at boot — copy it into the
 logger's `SENSOREGG_MAC` define for strict pairing, or leave the logger's
