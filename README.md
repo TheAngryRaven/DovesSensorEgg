@@ -1,5 +1,11 @@
 # DovesSensorEgg
 
+> **Status: experimental.** This is a proof-of-concept — the "wireless
+> sensor pod" idea is promising as a unit, but it needs more work and
+> conceptualization before being taken further. CI is deliberately basic
+> (a compile check and a couple of unit tests, below); no release
+> pipeline or auto-updating manifests until the concept firms up.
+
 Wireless sensor backpack for
 [DovesDataLogger](https://github.com/TheAngryRaven/DovesDataLogger).
 
@@ -76,3 +82,22 @@ in the field. A watchdog reboot is reported on serial
 Adafruit MCP9600, Adafruit SSD1306 (or SH110X — `USE_SH1106` flag),
 Adafruit GFX, Adafruit BusIO; Bluefruit nRF52 comes with the Seeed XIAO
 nRF52840 board package.
+
+## CI & tests
+
+Two deliberately-basic GitHub Actions workflows (same shapes as the
+DovesDataLogger repo's, minus everything release-related):
+
+- **compile-sketch** — compiles the sketch for the Seeed XIAO nRF52840
+  (the same board the datalogger uses) with the real libraries.
+- **unit-tests** — host-built doctest suite over the extracted pure
+  logic. `pw_adv_encode.{h,cpp}` builds the PW-ADV-1 payload, and its
+  golden-byte test uses the **same fixture bytes** as the logger repo's
+  `sensoregg_protocol` parser test — the two tests together pin the wire
+  contract from both ends. Run locally:
+
+  ```bash
+  cmake -S tests -B tests/build
+  cmake --build tests/build --parallel
+  ctest --test-dir tests/build --output-on-failure
+  ```

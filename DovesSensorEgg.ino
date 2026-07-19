@@ -28,6 +28,8 @@
 #include <Adafruit_MCP9600.h>
 #include <bluefruit.h>
 
+#include "pw_adv_encode.h"   // PW-ADV-1 payload builder (host-tested)
+
 // ---- SCREEN DRIVER: flip this if the boot border test looks wrong ----------
 #define USE_SH1106   0        // 1 = SH1106 (1.3")    0 = SSD1306 (0.96")
 #define OLED_W     128
@@ -75,9 +77,6 @@
 //   5    flags (bit0 pairing, bit1 TC fault)
 //   6-7  EGT int16 deci-degC  8-9  CJ int16 deci-degC
 //   10   raw MCP9600 STATUS   11   battery stub FF    12-13 sequence
-#define ADV_PAYLOAD_LEN 14
-#define ADV_PROTO_VER   0x01
-
 Adafruit_MCP9600 mcp;
 
 uint8_t  mcpAddr  = 0;
@@ -91,7 +90,8 @@ uint32_t pairUntil = 0;       // millis deadline; 0 = pairing window closed
 bool     advOK     = false;   // last Advertising.start() result
 uint32_t advFails  = 0;       // consecutive-rebuild failure count (debug)
 
-float c2f(float c) { return c * 9.0f / 5.0f + 32.0f; }
+// c2f() lives in pw_adv_encode (host-tested) — used by the debug screen.
+using pw_adv::c2f;
 
 // -------------------------------------------------- hardware watchdog
 // Field incident (2026-07-19): ~3-4 h into a session the app hung — prime
@@ -213,36 +213,8 @@ uint8_t btnEvent() {
 }
 
 // -------------------------------------------------- PW-ADV-1 encode
-// 0x8000 (INT16_MIN) = "no valid reading". Emit the sentinel instead of
-// casting NaN / out-of-range floats to int16_t - that cast is undefined
-// behavior and produces plausible-looking garbage.
-int16_t encodeDeciC(float c) {
-  if (isnan(c) || c < -270.0f || c > 1400.0f) return INT16_MIN;
-  return (int16_t)lroundf(c * 10.0f);
-}
-
-void buildAdvPayload(uint8_t out[ADV_PAYLOAD_LEN], float egtC, float cjC,
-                     uint8_t st) {
-  uint8_t flags = 0;
-  if (millis() < pairUntil) flags |= 0x01;   // pairing window active
-  if (st & 0x10)            flags |= 0x02;   // MCP input-range = TC fault
-
-  int16_t egt = encodeDeciC(egtC);
-  int16_t cj  = encodeDeciC(cjC);
-
-  out[0]  = 0xFF; out[1] = 0xFF;             // company ID (SIG test/internal)
-  out[2]  = 'P';  out[3] = 'W';              // magic
-  out[4]  = ADV_PROTO_VER;
-  out[5]  = flags;
-  out[6]  = (uint8_t)(egt & 0xFF);
-  out[7]  = (uint8_t)((egt >> 8) & 0xFF);
-  out[8]  = (uint8_t)(cj & 0xFF);
-  out[9]  = (uint8_t)((cj >> 8) & 0xFF);
-  out[10] = st;
-  out[11] = 0xFF;                            // battery: stub
-  out[12] = (uint8_t)(advSeq & 0xFF);
-  out[13] = (uint8_t)((advSeq >> 8) & 0xFF);
-}
+// Byte layout + sentinel rules live in pw_adv_encode.{h,cpp} (pure,
+// host-tested against the logger's parser fixture — the wire contract).
 
 // Rebuild the advertising data with fresh sensor values. stop -> clear ->
 // rebuild -> start is ugly and correct: Bluefruit has no supported
@@ -252,14 +224,15 @@ void buildAdvPayload(uint8_t out[ADV_PAYLOAD_LEN], float egtC, float cjC,
 // that looks exactly like a dead egg to the logger - so it's surfaced on
 // the debug screen ("ADV!") and serial instead of being swallowed.
 void updateAdvertising(float egtC, float cjC, uint8_t st) {
-  uint8_t payload[ADV_PAYLOAD_LEN];
+  uint8_t payload[pw_adv::kPayloadLen];
   advSeq++;                                  // one increment per adv update
-  buildAdvPayload(payload, egtC, cjC, st);
+  pw_adv::buildPayload(payload, egtC, cjC, st,
+                       millis() < pairUntil, advSeq);
 
   Bluefruit.Advertising.stop();
   Bluefruit.Advertising.clearData();
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
-  Bluefruit.Advertising.addManufacturerData(payload, ADV_PAYLOAD_LEN);
+  Bluefruit.Advertising.addManufacturerData(payload, pw_adv::kPayloadLen);
   Bluefruit.Advertising.addName();           // "PWEGT" - keeps nRF Connect useful
   advOK = Bluefruit.Advertising.start(0);    // 0 = advertise forever
   if (!advOK) {

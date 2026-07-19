@@ -1,0 +1,43 @@
+# Basic CI: prove the sketch compiles for the target board. Deliberately
+# minimal — no release pipeline, no OTA manifests, no size gates — the egg
+# is an experimental unit; take the CI further only when the concept does.
+name: compile-sketch
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  compile:
+    name: xiao-nrf52840
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Seeed nRF52 BSP shells out to adafruit-nrfutil during link to
+      # package the .hex into a .zip, even when only compiling — install
+      # it before the compile step. (Same note as the DovesDataLogger CI.)
+      - name: Install adafruit-nrfutil
+        run: pip install --user adafruit-nrfutil
+
+      - name: Compile sketch
+        uses: arduino/compile-sketches@v1
+        with:
+          # Same XIAO nRF52840 the datalogger uses (plain, not Sense).
+          fqbn: Seeeduino:nrf52:xiaonRF52840
+          platforms: |
+            - name: Seeeduino:nrf52
+              source-url: https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
+          libraries: |
+            - name: Adafruit MCP9600
+            - name: Adafruit GFX Library
+            - name: Adafruit SSD1306
+            - name: Adafruit SH110X
+            - name: Adafruit BusIO
+          sketch-paths: |
+            - .
