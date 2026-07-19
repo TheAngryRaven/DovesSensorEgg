@@ -28,6 +28,8 @@
 #include <Adafruit_MCP9600.h>
 #include <bluefruit.h>
 
+#include "pw_adv_encode.h"   // PW-ADV-1 payload builder (host-tested)
+
 // ---- SCREEN DRIVER: flip this if the boot border test looks wrong ----------
 #define USE_SH1106   0        // 1 = SH1106 (1.3")    0 = SSD1306 (0.96")
 #define OLED_W     128
@@ -75,9 +77,6 @@
 //   5    flags (bit0 pairing, bit1 TC fault)
 //   6-7  EGT int16 deci-degC  8-9  CJ int16 deci-degC
 //   10   raw MCP9600 STATUS   11   battery stub FF    12-13 sequence
-#define ADV_PAYLOAD_LEN 14
-#define ADV_PROTO_VER   0x01
-
 Adafruit_MCP9600 mcp;
 
 uint8_t  mcpAddr  = 0;
@@ -91,7 +90,42 @@ uint32_t pairUntil = 0;       // millis deadline; 0 = pairing window closed
 bool     advOK     = false;   // last Advertising.start() result
 uint32_t advFails  = 0;       // consecutive-rebuild failure count (debug)
 
-float c2f(float c) { return c * 9.0f / 5.0f + 32.0f; }
+// c2f() lives in pw_adv_encode (host-tested) — used by the debug screen.
+using pw_adv::c2f;
+
+// -------------------------------------------------- hardware watchdog
+// Field incident (2026-07-19): ~3-4 h into a session the app hung — prime
+// suspect a blocking MCP9600 I2C transaction wedged by ignition EMI (the
+// probe lead is an antenna, the MCP9600 clock-stretches, and this core's
+// Wire has no timeout) — while the SoftDevice kept rebroadcasting the
+// last-set advertising payload forever. Result: a zombie egg beaconing a
+// frozen value that the logger initially read as a live link.
+//
+// The nRF52840 hardware WDT reboots out of ANY such hang: it is fed once
+// per loop() pass, so a wedge anywhere (I2C, OLED, BLE) trips it within
+// WDT_TIMEOUT_S. Boot then runs i2cBusClear(), which is exactly the
+// recovery a wedged bus needs, and the sequence counter restarting from 0
+// is how the logger's zombie detection sees the egg come back to life.
+// Once started the WDT cannot be stopped or re-configured.
+#define WDT_TIMEOUT_S   8      // generous: setup()'s info screens take ~7 s
+#define FATAL_REBOOT_MS 30000  // fatal() shows its screen this long, then retries
+
+void wdtSetup() {
+  NRF_WDT->CONFIG = WDT_CONFIG_SLEEP_Run << WDT_CONFIG_SLEEP_Pos;
+  NRF_WDT->CRV    = WDT_TIMEOUT_S * 32768;              // 32768 Hz LFCLK
+  NRF_WDT->RREN   = WDT_RREN_RR0_Enabled << WDT_RREN_RR0_Pos;
+  NRF_WDT->TASKS_START = 1;
+}
+
+void wdtPet() { NRF_WDT->RR[0] = WDT_RR_RR_Reload; }
+
+// Read + clear the sticky reset-reason register; true if the previous run
+// died to the watchdog (i.e. the app hung and was auto-rebooted).
+bool wokeFromWatchdog() {
+  uint32_t rr = NRF_POWER->RESETREAS;
+  NRF_POWER->RESETREAS = rr;   // sticky until written — clear for next boot
+  return (rr & POWER_RESETREAS_DOG_Msk) != 0;
+}
 
 // -------------------------------------------------- I2C bus clear
 // A reset mid-transaction (e.g. reflashing while the MCP was being read)
@@ -179,36 +213,8 @@ uint8_t btnEvent() {
 }
 
 // -------------------------------------------------- PW-ADV-1 encode
-// 0x8000 (INT16_MIN) = "no valid reading". Emit the sentinel instead of
-// casting NaN / out-of-range floats to int16_t - that cast is undefined
-// behavior and produces plausible-looking garbage.
-int16_t encodeDeciC(float c) {
-  if (isnan(c) || c < -270.0f || c > 1400.0f) return INT16_MIN;
-  return (int16_t)lroundf(c * 10.0f);
-}
-
-void buildAdvPayload(uint8_t out[ADV_PAYLOAD_LEN], float egtC, float cjC,
-                     uint8_t st) {
-  uint8_t flags = 0;
-  if (millis() < pairUntil) flags |= 0x01;   // pairing window active
-  if (st & 0x10)            flags |= 0x02;   // MCP input-range = TC fault
-
-  int16_t egt = encodeDeciC(egtC);
-  int16_t cj  = encodeDeciC(cjC);
-
-  out[0]  = 0xFF; out[1] = 0xFF;             // company ID (SIG test/internal)
-  out[2]  = 'P';  out[3] = 'W';              // magic
-  out[4]  = ADV_PROTO_VER;
-  out[5]  = flags;
-  out[6]  = (uint8_t)(egt & 0xFF);
-  out[7]  = (uint8_t)((egt >> 8) & 0xFF);
-  out[8]  = (uint8_t)(cj & 0xFF);
-  out[9]  = (uint8_t)((cj >> 8) & 0xFF);
-  out[10] = st;
-  out[11] = 0xFF;                            // battery: stub
-  out[12] = (uint8_t)(advSeq & 0xFF);
-  out[13] = (uint8_t)((advSeq >> 8) & 0xFF);
-}
+// Byte layout + sentinel rules live in pw_adv_encode.{h,cpp} (pure,
+// host-tested against the logger's parser fixture — the wire contract).
 
 // Rebuild the advertising data with fresh sensor values. stop -> clear ->
 // rebuild -> start is ugly and correct: Bluefruit has no supported
@@ -218,14 +224,15 @@ void buildAdvPayload(uint8_t out[ADV_PAYLOAD_LEN], float egtC, float cjC,
 // that looks exactly like a dead egg to the logger - so it's surfaced on
 // the debug screen ("ADV!") and serial instead of being swallowed.
 void updateAdvertising(float egtC, float cjC, uint8_t st) {
-  uint8_t payload[ADV_PAYLOAD_LEN];
+  uint8_t payload[pw_adv::kPayloadLen];
   advSeq++;                                  // one increment per adv update
-  buildAdvPayload(payload, egtC, cjC, st);
+  pw_adv::buildPayload(payload, egtC, cjC, st,
+                       millis() < pairUntil, advSeq);
 
   Bluefruit.Advertising.stop();
   Bluefruit.Advertising.clearData();
   Bluefruit.Advertising.addFlags(BLE_GAP_ADV_FLAGS_LE_ONLY_GENERAL_DISC_MODE);
-  Bluefruit.Advertising.addManufacturerData(payload, ADV_PAYLOAD_LEN);
+  Bluefruit.Advertising.addManufacturerData(payload, pw_adv::kPayloadLen);
   Bluefruit.Advertising.addName();           // "PWEGT" - keeps nRF Connect useful
   advOK = Bluefruit.Advertising.start(0);    // 0 = advertise forever
   if (!advOK) {
@@ -264,22 +271,33 @@ void bleSetup() {
     oled.setCursor(0, 32); oled.print(macStr);
     oled.display();
     delay(3000);
+    wdtPet();  // 3 s hold — stay inside the watchdog window
   }
 }
 
 // -------------------------------------------------- fatal halt
+// Shows the message long enough to read, then hard-resets and tries again:
+// a TRANSIENT boot failure (EMI glitch during the MCP probe, marginal
+// battery sag) self-heals instead of bricking the pod for the day, while a
+// permanent fault (probe genuinely absent) still shows a readable screen
+// 30 s out of every retry cycle. The WDT is fed while the screen is up —
+// this halt is deliberate, not a hang.
 void fatal(const char* msg) {
   Serial.print("FATAL: "); Serial.println(msg);
+  const uint32_t t0 = millis();
   while (1) {
+    wdtPet();
     if (oledOK) {
       oled.clearDisplay();
       oled.setTextSize(2); oled.setTextColor(PX_ON, PX_OFF);
       oled.setCursor(0, 0);  oled.print("FATAL");
       oled.setTextSize(1);
       oled.setCursor(0, 24); oled.print(msg);
+      oled.setCursor(0, 54); oled.print("retrying in 30s");
       oled.display();
     }
     delay(1000);
+    if (millis() - t0 >= FATAL_REBOOT_MS) NVIC_SystemReset();
   }
 }
 
@@ -297,6 +315,7 @@ void borderTest() {
   oled.print(DRV_NAME);
   oled.display();
   delay(2500);
+  wdtPet();  // 2.5 s hold — stay inside the watchdog window
 }
 
 // -------------------------------------------------- main screen
@@ -337,12 +356,23 @@ void drawScreen(float egtC, float cjC, uint8_t st) {
 
 // -------------------------------------------------- setup
 void setup() {
+  // Reset-cause first (the register is sticky), THEN arm the WDT — from
+  // here on a hang anywhere reboots the pod instead of zombifying it.
+  const bool wdtReboot = wokeFromWatchdog();
+  wdtSetup();
+
   pinMode(BTN_PIN, INPUT_PULLUP);
 
   Serial.begin(115200);
   while (!Serial && millis() < 3000) { }     // don't block forever on battery
 
   Serial.println("\nDovesSensorEgg - wireless EGT pod (PW-ADV-1)");
+  if (wdtReboot) {
+    // The previous run hung (I2C wedge under ignition EMI is the known
+    // suspect) and the watchdog pulled us out. The i2cBusClear() below is
+    // exactly the recovery that wedge needs.
+    Serial.println("!! WATCHDOG REBOOT - previous run hung");
+  }
 
   i2cBusClear();               // recover a slave wedged by a mid-read reset
   Wire.begin();
@@ -375,8 +405,10 @@ void setup() {
     oled.setCursor(0, 32); oled.print("MCP  ");
     if (mcpAddr) { oled.print("0x"); oled.print(mcpAddr, HEX); }
     else           oled.print("NOT FOUND");
+    if (wdtReboot) { oled.setCursor(0, 54); oled.print("WDT RESET"); }
     oled.display();
     delay(2000);
+    wdtPet();
   }
 
   if (!mcpAddr) fatal("MCP not on bus");
@@ -401,6 +433,7 @@ void setup() {
         Serial.println("<read failed>");
       }
       delay(200);
+      wdtPet();
     }
   }
   if (!mcpOK) fatal("MCP begin() fail");
@@ -419,6 +452,8 @@ void setup() {
 
 // -------------------------------------------------- loop
 void loop() {
+  wdtPet();  // sole feed point: a wedge ANYWHERE below reboots the pod
+
   static uint32_t tRead = 0, tAdv = 0, tDraw = 0, tSer = 0;
   static float    egtC = NAN, cjC = NAN;
   static uint8_t  st = 0;

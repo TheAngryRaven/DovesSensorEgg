@@ -1,5 +1,11 @@
 # DovesSensorEgg
 
+> **Status: experimental.** This is a proof-of-concept — the "wireless
+> sensor pod" idea is promising as a unit, but it needs more work and
+> conceptualization before being taken further. CI is deliberately basic
+> (a compile check and a couple of unit tests, below); no release
+> pipeline or auto-updating manifests until the concept firms up.
+
 Wireless sensor backpack for
 [DovesDataLogger](https://github.com/TheAngryRaven/DovesDataLogger).
 
@@ -58,8 +64,40 @@ The egg prints its MAC on serial and the OLED at boot — copy it into the
 logger's `SENSOREGG_MAC` define for strict pairing, or leave the logger's
 default all-zeros to accept any egg.
 
+## Reliability
+
+The nRF52840 hardware **watchdog** (8 s) is armed first thing at boot and
+fed once per `loop()` pass: a hang anywhere — the known case is a blocking
+MCP9600 I2C transaction wedged by ignition EMI, which left the radio
+beaconing a frozen payload for hours (a "zombie egg") — reboots the pod
+within seconds. Boot's I2C bus-clear then recovers the wedged bus, and the
+sequence counter restarting tells the logger's zombie detection the egg is
+live again. A `FATAL` boot failure (probe absent) shows its screen for
+30 s, then hard-resets and retries, so a transient boot glitch self-heals
+in the field. A watchdog reboot is reported on serial
+(`!! WATCHDOG REBOOT`) and as `WDT RESET` on the boot scan screen.
+
 ## Libraries
 
 Adafruit MCP9600, Adafruit SSD1306 (or SH110X — `USE_SH1106` flag),
 Adafruit GFX, Adafruit BusIO; Bluefruit nRF52 comes with the Seeed XIAO
 nRF52840 board package.
+
+## CI & tests
+
+Two deliberately-basic GitHub Actions workflows (same shapes as the
+DovesDataLogger repo's, minus everything release-related):
+
+- **compile-sketch** — compiles the sketch for the Seeed XIAO nRF52840
+  (the same board the datalogger uses) with the real libraries.
+- **unit-tests** — host-built doctest suite over the extracted pure
+  logic. `pw_adv_encode.{h,cpp}` builds the PW-ADV-1 payload, and its
+  golden-byte test uses the **same fixture bytes** as the logger repo's
+  `sensoregg_protocol` parser test — the two tests together pin the wire
+  contract from both ends. Run locally:
+
+  ```bash
+  cmake -S tests -B tests/build
+  cmake --build tests/build --parallel
+  ctest --test-dir tests/build --output-on-failure
+  ```
