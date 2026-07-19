@@ -93,6 +93,40 @@ uint32_t advFails  = 0;       // consecutive-rebuild failure count (debug)
 
 float c2f(float c) { return c * 9.0f / 5.0f + 32.0f; }
 
+// -------------------------------------------------- hardware watchdog
+// Field incident (2026-07-19): ~3-4 h into a session the app hung — prime
+// suspect a blocking MCP9600 I2C transaction wedged by ignition EMI (the
+// probe lead is an antenna, the MCP9600 clock-stretches, and this core's
+// Wire has no timeout) — while the SoftDevice kept rebroadcasting the
+// last-set advertising payload forever. Result: a zombie egg beaconing a
+// frozen value that the logger initially read as a live link.
+//
+// The nRF52840 hardware WDT reboots out of ANY such hang: it is fed once
+// per loop() pass, so a wedge anywhere (I2C, OLED, BLE) trips it within
+// WDT_TIMEOUT_S. Boot then runs i2cBusClear(), which is exactly the
+// recovery a wedged bus needs, and the sequence counter restarting from 0
+// is how the logger's zombie detection sees the egg come back to life.
+// Once started the WDT cannot be stopped or re-configured.
+#define WDT_TIMEOUT_S   8      // generous: setup()'s info screens take ~7 s
+#define FATAL_REBOOT_MS 30000  // fatal() shows its screen this long, then retries
+
+void wdtSetup() {
+  NRF_WDT->CONFIG = WDT_CONFIG_SLEEP_Run << WDT_CONFIG_SLEEP_Pos;
+  NRF_WDT->CRV    = WDT_TIMEOUT_S * 32768;              // 32768 Hz LFCLK
+  NRF_WDT->RREN   = WDT_RREN_RR0_Enabled << WDT_RREN_RR0_Pos;
+  NRF_WDT->TASKS_START = 1;
+}
+
+void wdtPet() { NRF_WDT->RR[0] = WDT_RR_RR_Reload; }
+
+// Read + clear the sticky reset-reason register; true if the previous run
+// died to the watchdog (i.e. the app hung and was auto-rebooted).
+bool wokeFromWatchdog() {
+  uint32_t rr = NRF_POWER->RESETREAS;
+  NRF_POWER->RESETREAS = rr;   // sticky until written — clear for next boot
+  return (rr & POWER_RESETREAS_DOG_Msk) != 0;
+}
+
 // -------------------------------------------------- I2C bus clear
 // A reset mid-transaction (e.g. reflashing while the MCP was being read)
 // can leave a slave driving SDA low - the address scan still half-works
@@ -264,22 +298,33 @@ void bleSetup() {
     oled.setCursor(0, 32); oled.print(macStr);
     oled.display();
     delay(3000);
+    wdtPet();  // 3 s hold — stay inside the watchdog window
   }
 }
 
 // -------------------------------------------------- fatal halt
+// Shows the message long enough to read, then hard-resets and tries again:
+// a TRANSIENT boot failure (EMI glitch during the MCP probe, marginal
+// battery sag) self-heals instead of bricking the pod for the day, while a
+// permanent fault (probe genuinely absent) still shows a readable screen
+// 30 s out of every retry cycle. The WDT is fed while the screen is up —
+// this halt is deliberate, not a hang.
 void fatal(const char* msg) {
   Serial.print("FATAL: "); Serial.println(msg);
+  const uint32_t t0 = millis();
   while (1) {
+    wdtPet();
     if (oledOK) {
       oled.clearDisplay();
       oled.setTextSize(2); oled.setTextColor(PX_ON, PX_OFF);
       oled.setCursor(0, 0);  oled.print("FATAL");
       oled.setTextSize(1);
       oled.setCursor(0, 24); oled.print(msg);
+      oled.setCursor(0, 54); oled.print("retrying in 30s");
       oled.display();
     }
     delay(1000);
+    if (millis() - t0 >= FATAL_REBOOT_MS) NVIC_SystemReset();
   }
 }
 
@@ -297,6 +342,7 @@ void borderTest() {
   oled.print(DRV_NAME);
   oled.display();
   delay(2500);
+  wdtPet();  // 2.5 s hold — stay inside the watchdog window
 }
 
 // -------------------------------------------------- main screen
@@ -337,12 +383,23 @@ void drawScreen(float egtC, float cjC, uint8_t st) {
 
 // -------------------------------------------------- setup
 void setup() {
+  // Reset-cause first (the register is sticky), THEN arm the WDT — from
+  // here on a hang anywhere reboots the pod instead of zombifying it.
+  const bool wdtReboot = wokeFromWatchdog();
+  wdtSetup();
+
   pinMode(BTN_PIN, INPUT_PULLUP);
 
   Serial.begin(115200);
   while (!Serial && millis() < 3000) { }     // don't block forever on battery
 
   Serial.println("\nDovesSensorEgg - wireless EGT pod (PW-ADV-1)");
+  if (wdtReboot) {
+    // The previous run hung (I2C wedge under ignition EMI is the known
+    // suspect) and the watchdog pulled us out. The i2cBusClear() below is
+    // exactly the recovery that wedge needs.
+    Serial.println("!! WATCHDOG REBOOT - previous run hung");
+  }
 
   i2cBusClear();               // recover a slave wedged by a mid-read reset
   Wire.begin();
@@ -375,8 +432,10 @@ void setup() {
     oled.setCursor(0, 32); oled.print("MCP  ");
     if (mcpAddr) { oled.print("0x"); oled.print(mcpAddr, HEX); }
     else           oled.print("NOT FOUND");
+    if (wdtReboot) { oled.setCursor(0, 54); oled.print("WDT RESET"); }
     oled.display();
     delay(2000);
+    wdtPet();
   }
 
   if (!mcpAddr) fatal("MCP not on bus");
@@ -401,6 +460,7 @@ void setup() {
         Serial.println("<read failed>");
       }
       delay(200);
+      wdtPet();
     }
   }
   if (!mcpOK) fatal("MCP begin() fail");
@@ -419,6 +479,8 @@ void setup() {
 
 // -------------------------------------------------- loop
 void loop() {
+  wdtPet();  // sole feed point: a wedge ANYWHERE below reboots the pod
+
   static uint32_t tRead = 0, tAdv = 0, tDraw = 0, tSer = 0;
   static float    egtC = NAN, cjC = NAN;
   static uint8_t  st = 0;
