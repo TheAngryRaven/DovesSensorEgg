@@ -2,7 +2,7 @@
    DovesSensorEgg - wireless EGT pod (PW-ADV-1 broadcaster)
    XIAO nRF52840 + Adafruit MCP9600 + I2C OLED + button
 
-   Boot -> scan I2C -> border test -> BLE up (MAC shown) -> live temp on
+   Boot -> bird splash -> scan I2C -> BLE up (MAC shown) -> live temp on
    screen + serial + BLE advertising.
 
    BLE: pure BROADCASTER. EGT + cold junction are packed into a 14-byte
@@ -37,12 +37,13 @@
 #include <Wire.h>
 #include <bluefruit.h>
 
+#include "images.h"          // boot splash (the bird, from DovesDataLogger)
 #include "pw_adv_encode.h"   // PW-ADV-1 payload builder (host-tested)
 #include "soft_i2c.h"        // timeout-capable bit-banged bus (MCP9600)
 #include "mcp9600.h"         // register driver over the soft bus
 #include "mcp9600_regs.h"    // host-tested register codecs
 
-// ---- SCREEN DRIVER: flip this if the boot border test looks wrong ----------
+// ---- SCREEN DRIVER: flip this if the boot splash geometry looks wrong ------
 #define USE_SH1106   0        // 1 = SH1106 (1.3")    0 = SSD1306 (0.96")
 #define OLED_W     128
 #define OLED_H      64
@@ -377,23 +378,6 @@ void fatal(const char* msg) {
   }
 }
 
-// -------------------------------------------------- boot border test
-// Correct driver  -> border hugs all four edges, X hits all four corners.
-// Wrong driver    -> 2px gap one side, clipped/noisy stripe the other.
-void borderTest() {
-  oled.clearDisplay();
-  oled.drawRect(0, 0, OLED_W, OLED_H, PX_ON);
-  oled.drawLine(0, 0, OLED_W - 1, OLED_H - 1, PX_ON);
-  oled.drawLine(OLED_W - 1, 0, 0, OLED_H - 1, PX_ON);
-  oled.setTextSize(1);
-  oled.setTextColor(PX_ON, PX_OFF);
-  oled.setCursor(40, 28);
-  oled.print(DRV_NAME);
-  oled.display();
-  delay(2500);
-  wdtPet();  // 2.5 s hold — stay inside the watchdog window
-}
-
 // -------------------------------------------------- sleep countdown screen
 void drawSleepCountdown(uint32_t secondsLeft) {
   if (!oledOK) return;
@@ -417,33 +401,40 @@ void drawScreen(float egtC, float cjC, uint8_t st) {
   oled.clearDisplay();
   oled.setTextColor(PX_ON, PX_OFF);
 
+  // Bicolor panel: rows 0-15 are the yellow band. Header = the info:
+  // address, data-ready (STATUS bit6), probe fault (STATUS bit4), scale.
+  // 0xFF status = bus fault -> both flags unknown, don't fake health.
+  const bool stValid = (st != 0xFF);
   oled.setTextSize(1);
-  oled.setCursor(0, 0);
-  oled.print("EGT @0x"); oled.print(mcpAddr, HEX);
-  oled.setCursor(OLED_W - 6, 0);
+  oled.setCursor(0, 4);
+  oled.print("0x"); oled.print(mcpAddr, HEX);
+  oled.setCursor(36, 4);
+  oled.print((stValid && (st & 0x40)) ? "RDY" : "--");
+  oled.setCursor(66, 4);
+  oled.print(!stValid ? "?" : ((st & 0x10) ? "OPEN" : "OK"));
+  oled.setCursor(OLED_W - 6, 4);
   oled.print(showF ? "F" : "C");
 
-  // Bicolor panel: rows 0-15 are the yellow band, the rest blue. The
-  // header row lives in yellow; everything below starts at y=16 so the
-  // big glyphs never bleed into the band (they used to start at 14).
-  // The bottom line at y=56 ends exactly at row 63.
+  // Blue: just the temperatures.
   oled.setTextSize(3);
-  oled.setCursor(0, 16);
+  oled.setCursor(0, 20);
   if (isnan(egt)) oled.print("---");
   else            oled.print(egt, 1);
 
   oled.setTextSize(1);
-  oled.setCursor(0, 44);
-  oled.print("CJ "); oled.print(cj, 1); oled.print(showF ? " F" : " C");
-
-  oled.setCursor(0, 56);
-  oled.print("ST ");
-  if (st < 0x10) oled.print("0");
-  oled.print(st, HEX);
-  if (st & 0x10) oled.print(" OPEN?");
-  oled.print(" #"); oled.print(advSeq);         // adv sequence counter
-  if (!advOK)               oled.print(" ADV!"); // last adv restart failed
-  else if (millis() < pairUntil) oled.print(" PAIR");
+  oled.setCursor(0, 52);
+  oled.print("CJ ");
+  if (isnan(cj)) {
+    oled.print("---");
+  } else {
+    oled.print(cj, 1); oled.print(showF ? " F" : " C");
+  }
+  // Transient states borrow the bottom-right corner (normally blank).
+  if (!advOK) {
+    oled.setCursor(OLED_W - 24, 52); oled.print("ADV!");
+  } else if (millis() < pairUntil) {
+    oled.setCursor(OLED_W - 24, 52); oled.print("PAIR");
+  }
 
   oled.display();
 }
@@ -517,7 +508,13 @@ void setup() {
   mcpAddr = mcp.addr;
 
   if (oledOK) {
-    borderTest();
+    // Boot splash — the bird, same art as the datalogger.
+    oled.clearDisplay();
+    oled.drawBitmap(0, 0, image_data_bird1, 128, 64, PX_ON);
+    oled.display();
+    delay(2500);
+    wdtPet();  // 2.5 s hold — stay inside the watchdog window
+
     oled.clearDisplay();
     oled.setTextSize(1); oled.setTextColor(PX_ON, PX_OFF);
     oled.setCursor(0, 0);  oled.print("I2C SCAN");
