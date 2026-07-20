@@ -14,7 +14,11 @@
 
    Button on D1: short press toggles C / F on the debug screen; long
    press (>1 s) opens a 30 s pairing window (advertises flags bit0 -
-   informational, the logger pairs by MAC/magic).
+   informational, the logger pairs by MAC/magic); held 10 s -> deep
+   sleep (nRF52 System OFF, display + MCP + radio all down, ~uA - the
+   enclosure has no power switch). Wake = hold the button 5 s: the
+   press wakes the chip, but boot goes straight back to sleep unless
+   the button stays held - a pocket bump never lights the screen.
 
    Libraries (Arduino Library Manager):
      Adafruit MCP9600
@@ -42,12 +46,14 @@
   #define PX_ON   SH110X_WHITE
   #define PX_OFF  SH110X_BLACK
   #define DRV_NAME "SH1106"
+  #define DISPLAY_OFF() oled.oled_command(SH110X_DISPLAYOFF)
 #else
   #include <Adafruit_SSD1306.h>
   Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, -1);
   #define PX_ON   SSD1306_WHITE
   #define PX_OFF  SSD1306_BLACK
   #define DRV_NAME "SSD1306"
+  #define DISPLAY_OFF() oled.ssd1306_command(SSD1306_DISPLAYOFF)
 #endif
 
 #define BTN_PIN     D1
@@ -68,6 +74,11 @@
 
 #define BTN_LONG_MS   1000    // long press -> pairing window
 #define PAIR_WINDOW_MS 30000  // flags bit0 stays set this long
+
+// ---- deep sleep (System OFF — no power switch on the enclosure) ----------
+#define SLEEP_HOLD_MS 10000   // button held this long -> deep sleep
+#define WAKE_HOLD_MS   5000   // wake press must be HELD this long to boot
+#define SLEEP_HINT_MS  2000   // hold this long -> on-screen sleep countdown
 
 // ---- PW-ADV-1 payload (14 bytes, little-endian fields) --------------------
 // Bluefruit's addManufacturerData() passes the buffer through RAW - it does
@@ -119,12 +130,79 @@ void wdtSetup() {
 
 void wdtPet() { NRF_WDT->RR[0] = WDT_RR_RR_Reload; }
 
-// Read + clear the sticky reset-reason register; true if the previous run
-// died to the watchdog (i.e. the app hung and was auto-rebooted).
-bool wokeFromWatchdog() {
+// Read + clear the sticky reset-reason register. Callers test the bits:
+// DOG = previous run hung and the watchdog rebooted it; OFF = a GPIO
+// (the button) woke the chip out of System OFF deep sleep.
+uint32_t captureResetReason() {
   uint32_t rr = NRF_POWER->RESETREAS;
   NRF_POWER->RESETREAS = rr;   // sticky until written — clear for next boot
-  return (rr & POWER_RESETREAS_DOG_Msk) != 0;
+  return rr;
+}
+
+// -------------------------------------------------- deep sleep (System OFF)
+// Mirrors the DovesDataLogger's shutdownSystemOff() on the same MCU. Wake
+// is a full reset (RESETREAS.OFF records the cause); the WDT halts with
+// every other clock and re-arms on the fresh boot. Does not return.
+void systemOff() {
+  wdtPet();
+  // Wake source: SENSE-LOW with pull-up on the button (active low). Pull +
+  // SENSE config is retained in System OFF; P-number via the pin map.
+  nrf_gpio_cfg_sense_input(g_ADigitalPinMap[BTN_PIN],
+                           NRF_GPIO_PIN_PULLUP, NRF_GPIO_PIN_SENSE_LOW);
+  // A set LATCH bit is a pending DETECT = instant re-wake; clear last.
+  NRF_P0->LATCH = 0xFFFFFFFF;
+  NRF_P1->LATCH = 0xFFFFFFFF;
+  // Cortex-M4F: a pending FPU exception can inhibit low-power entry.
+  __set_FPSCR(__get_FPSCR() & ~0x9F);
+  NVIC_ClearPendingIRQ(FPU_IRQn);
+  // NRF_POWER is restricted while the SoftDevice is enabled (it is, once
+  // bleSetup() has run — but the early wake-hold gate sleeps before that).
+  uint8_t sdEnabled = 0;
+  (void)sd_softdevice_is_enabled(&sdEnabled);
+  if (sdEnabled) {
+    sd_power_reset_reason_clr(0xFFFFFFFF);
+    (void)sd_power_system_off();
+  } else {
+    NRF_POWER->RESETREAS = 0xFFFFFFFF;
+    NRF_POWER->SYSTEMOFF = 1;
+  }
+  // Only reachable in emulated System OFF (debugger attached).
+  while (true) { __WFE(); }
+}
+
+// Full teardown then System OFF: radio silent, MCP9600 in shutdown mode,
+// display dark. Does not return.
+void enterDeepSleep() {
+  Serial.println("deep sleep - hold button 5 s to wake");
+  Bluefruit.Advertising.stop();
+  if (mcpAddr) mcp.enable(false);          // MCP9600 shutdown (~uA)
+  if (oledOK) {
+    oled.clearDisplay();
+    oled.display();
+    DISPLAY_OFF();
+  }
+  // Held button = SENSE satisfied = instant re-wake; wait for release.
+  while (digitalRead(BTN_PIN) == LOW) { wdtPet(); delay(10); }
+  delay(50);   // contact settle
+  systemOff();
+}
+
+// System OFF button wake: require a deliberate WAKE_HOLD_MS hold before
+// booting. Released early -> straight back to sleep. Nothing is drawn and
+// no peripheral is touched, so a pocket bump never lights the screen.
+void wakeHoldGate() {
+  const uint32_t t0 = millis();
+  while (digitalRead(BTN_PIN) == LOW) {
+    wdtPet();
+    if (millis() - t0 >= WAKE_HOLD_MS) {
+      // Confirmed. Swallow the rest of the hold so the press doesn't fall
+      // through into btnEvent() as a C/F toggle or pairing long-press.
+      while (digitalRead(BTN_PIN) == LOW) { wdtPet(); delay(10); }
+      return;
+    }
+    delay(10);
+  }
+  systemOff();  // released early — back to sleep
 }
 
 // -------------------------------------------------- I2C bus clear
@@ -318,6 +396,20 @@ void borderTest() {
   wdtPet();  // 2.5 s hold — stay inside the watchdog window
 }
 
+// -------------------------------------------------- sleep countdown screen
+void drawSleepCountdown(uint32_t secondsLeft) {
+  if (!oledOK) return;
+  oled.clearDisplay();
+  oled.setTextColor(PX_ON, PX_OFF);
+  oled.setTextSize(2);
+  oled.setCursor(10, 8);
+  oled.print("SLEEP in");
+  oled.setTextSize(3);
+  oled.setCursor(56, 32);
+  oled.print(secondsLeft);
+  oled.display();
+}
+
 // -------------------------------------------------- main screen
 void drawScreen(float egtC, float cjC, uint8_t st) {
   if (!oledOK) return;
@@ -358,10 +450,17 @@ void drawScreen(float egtC, float cjC, uint8_t st) {
 void setup() {
   // Reset-cause first (the register is sticky), THEN arm the WDT — from
   // here on a hang anywhere reboots the pod instead of zombifying it.
-  const bool wdtReboot = wokeFromWatchdog();
+  const uint32_t resetReas = captureResetReason();
+  const bool wdtReboot = (resetReas & POWER_RESETREAS_DOG_Msk) != 0;
+  const bool offWake   = (resetReas & POWER_RESETREAS_OFF_Msk) != 0;
   wdtSetup();
 
   pinMode(BTN_PIN, INPUT_PULLUP);
+
+  // Woken out of deep sleep by the button: demand the 5 s hold before
+  // anything else powers up. (A watchdog reboot skips this — after a hang
+  // the pod must come back broadcasting without a human.)
+  if (offWake) wakeHoldGate();
 
   Serial.begin(115200);
   while (!Serial && millis() < 3000) { }     // don't block forever on battery
@@ -469,6 +568,20 @@ void loop() {
     tDraw = 0;
   }
 
+  // Deep-sleep hold: raw level, independent of btnEvent()'s edge logic.
+  // (The pairing long-press fires at 1 s on the way to 10 s — harmless,
+  // the pod sleeps right after and advertising stops anyway.) The
+  // countdown screen below makes the 10 s hold legible from ~2 s in.
+  static uint32_t sleepHoldSince = 0;
+  const bool btnDown = digitalRead(BTN_PIN) == LOW;
+  if (!btnDown) {
+    sleepHoldSince = 0;
+  } else if (sleepHoldSince == 0) {
+    sleepHoldSince = millis();
+  } else if (millis() - sleepHoldSince >= SLEEP_HOLD_MS) {
+    enterDeepSleep();                            // does not return
+  }
+
   if (millis() - tRead >= READ_MS) {
     tRead = millis();
     egtC  = mcp.readThermocouple();
@@ -489,7 +602,13 @@ void loop() {
 
   if (millis() - tDraw >= DRAW_MS) {
     tDraw = millis();
-    drawScreen(egtC, cjC, st);
+    if (btnDown && sleepHoldSince != 0 &&
+        millis() - sleepHoldSince >= SLEEP_HINT_MS) {
+      drawSleepCountdown(
+          (SLEEP_HOLD_MS - (millis() - sleepHoldSince) + 999) / 1000);
+    } else {
+      drawScreen(egtC, cjC, st);
+    }
   }
 
   if (millis() - tSer >= SERIAL_MS) {
