@@ -402,8 +402,9 @@ void drawScreen(float egtC, float cjC, uint8_t st) {
   oled.setTextColor(PX_ON, PX_OFF);
 
   // Bicolor panel: rows 0-15 are the yellow band. Header = the info:
-  // address, data-ready (STATUS bit6), probe fault (STATUS bit4), scale.
-  // 0xFF status = bus fault -> both flags unknown, don't fake health.
+  // address, data-ready (STATUS bit6), probe fault (STATUS bit4), and the
+  // advertising packet counter (right-aligned). The scale lives on the CJ
+  // line. 0xFF status = bus fault -> flags unknown, don't fake health.
   const bool stValid = (st != 0xFF);
   oled.setTextSize(1);
   oled.setCursor(0, 4);
@@ -412,28 +413,40 @@ void drawScreen(float egtC, float cjC, uint8_t st) {
   oled.print((stValid && (st & 0x40)) ? "RDY" : "--");
   oled.setCursor(66, 4);
   oled.print(!stValid ? "?" : ((st & 0x10) ? "OPEN" : "OK"));
-  oled.setCursor(OLED_W - 6, 4);
-  oled.print(showF ? "F" : "C");
+  char seqStr[8];
+  snprintf(seqStr, sizeof(seqStr), "#%u", (unsigned)advSeq);
+  oled.setCursor(OLED_W - 6 * (int16_t)strlen(seqStr), 4);
+  oled.print(seqStr);
 
-  // Blue: just the temperatures.
-  oled.setTextSize(3);
-  oled.setCursor(0, 20);
-  if (isnan(egt)) oled.print("---");
-  else            oled.print(egt, 1);
-
-  oled.setTextSize(1);
-  oled.setCursor(0, 52);
-  oled.print("CJ ");
-  if (isnan(cj)) {
-    oled.print("---");
+  // Blue: just the temperatures, centered. Widths are computed from the
+  // formatted strings (dtostrf — this core's printf lacks reliable %f).
+  char numBuf[12];
+  char lineBuf[20];
+  if (isnan(egt)) {
+    snprintf(lineBuf, sizeof(lineBuf), "---");
   } else {
-    oled.print(cj, 1); oled.print(showF ? " F" : " C");
+    dtostrf(egt, 1, 1, numBuf);
+    snprintf(lineBuf, sizeof(lineBuf), "%s", numBuf);
   }
+  oled.setTextSize(3);  // 18 px per glyph
+  oled.setCursor((OLED_W - 18 * (int16_t)strlen(lineBuf)) / 2, 20);
+  oled.print(lineBuf);
+
+  if (isnan(cj)) {
+    snprintf(lineBuf, sizeof(lineBuf), "CJ ---");
+  } else {
+    dtostrf(cj, 1, 1, numBuf);
+    snprintf(lineBuf, sizeof(lineBuf), "CJ %s %c", numBuf, showF ? 'F' : 'C');
+  }
+  oled.setTextSize(1);  // 6 px per glyph
+  oled.setCursor((OLED_W - 6 * (int16_t)strlen(lineBuf)) / 2, 50);
+  oled.print(lineBuf);
+
   // Transient states borrow the bottom-right corner (normally blank).
   if (!advOK) {
-    oled.setCursor(OLED_W - 24, 52); oled.print("ADV!");
+    oled.setCursor(OLED_W - 24, 56); oled.print("ADV!");
   } else if (millis() < pairUntil) {
-    oled.setCursor(OLED_W - 24, 52); oled.print("PAIR");
+    oled.setCursor(OLED_W - 24, 56); oled.print("PAIR");
   }
 
   oled.display();
