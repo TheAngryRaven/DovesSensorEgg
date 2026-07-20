@@ -423,16 +423,20 @@ void drawScreen(float egtC, float cjC, uint8_t st) {
   oled.setCursor(OLED_W - 6, 0);
   oled.print(showF ? "F" : "C");
 
+  // Bicolor panel: rows 0-15 are the yellow band, the rest blue. The
+  // header row lives in yellow; everything below starts at y=16 so the
+  // big glyphs never bleed into the band (they used to start at 14).
+  // The bottom line at y=56 ends exactly at row 63.
   oled.setTextSize(3);
-  oled.setCursor(0, 14);
+  oled.setCursor(0, 16);
   if (isnan(egt)) oled.print("---");
   else            oled.print(egt, 1);
 
   oled.setTextSize(1);
-  oled.setCursor(0, 42);
+  oled.setCursor(0, 44);
   oled.print("CJ "); oled.print(cj, 1); oled.print(showF ? " F" : " C");
 
-  oled.setCursor(0, 54);
+  oled.setCursor(0, 56);
   oled.print("ST ");
   if (st < 0x10) oled.print("0");
   oled.print(st, HEX);
