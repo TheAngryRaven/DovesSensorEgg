@@ -36,6 +36,7 @@
 
 #include <Wire.h>
 #include <bluefruit.h>
+#include <avr/dtostrf.h>     // dtostrf() needs its own header on this core
 
 #include "images.h"          // boot splash (the bird, from DovesDataLogger)
 #include "pw_adv_encode.h"   // PW-ADV-1 payload builder (host-tested)
