@@ -13,7 +13,9 @@ set(EGG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/..)
 add_executable(sensoregg_tests
   test_main.cpp
   pw_adv_encode_test.cpp
+  mcp9600_regs_test.cpp
   ${EGG_DIR}/pw_adv_encode.cpp
+  ${EGG_DIR}/mcp9600_regs.cpp
 )
 
 target_include_directories(sensoregg_tests PRIVATE

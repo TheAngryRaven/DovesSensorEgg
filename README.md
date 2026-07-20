@@ -45,14 +45,24 @@ cast to int16 (UB). The logger treats readings older than 1 s as gone
 
 ## Hardware
 
+> **Wiring changed 2026-07-20**: the MCP9600 moved to its own bus (D2/D3).
+> Older builds had it sharing D4/D5 with the OLED.
+
 | Signal | XIAO pin |
 |---|---|
-| MCP9600 + OLED SCL | D5 |
-| MCP9600 + OLED SDA | D4 |
+| OLED SCL (hardware `Wire`, 400 kHz) | D5 |
+| OLED SDA | D4 |
+| MCP9600 SCL (dedicated soft bus, ~50 kHz) | D3 |
+| MCP9600 SDA | D2 |
 | Button | D1 ↔ GND (`INPUT_PULLUP`) |
 
-I2C addresses are auto-detected at boot (`0x3C/0x3D` OLED,
-`0x60–0x67` MCP9600). K-type polarity: **red is negative** (US ANSI).
+The MCP9600's bus is bit-banged with a per-transaction timeout and runs
+deliberately slow for EMI margin — the chip clock-stretches aggressively
+and its probe lead is an antenna. 4.7 kΩ pullups to 3V3 recommended on
+D2/D3 (the internal ~13 kΩ pullups are workable at this speed). Addresses
+auto-detect at boot: OLED `0x3C/0x3D` (probe), MCP9600 `0x60–0x67` via a
+retried **ID-register handshake** — never a blind probe, which this chip
+is known to dislike. K-type polarity: **red is negative** (US ANSI).
 
 ## Controls
 
@@ -74,22 +84,37 @@ default all-zeros to accept any egg.
 
 ## Reliability
 
-The nRF52840 hardware **watchdog** (8 s) is armed first thing at boot and
-fed once per `loop()` pass: a hang anywhere — the known case is a blocking
-MCP9600 I2C transaction wedged by ignition EMI, which left the radio
-beaconing a frozen payload for hours (a "zombie egg") — reboots the pod
-within seconds. Boot's I2C bus-clear then recovers the wedged bus, and the
-sequence counter restarting tells the logger's zombie detection the egg is
-live again. A `FATAL` boot failure (probe absent) shows its screen for
-30 s, then hard-resets and retries, so a transient boot glitch self-heals
-in the field. A watchdog reboot is reported on serial
-(`!! WATCHDOG REBOOT`) and as `WDT RESET` on the boot scan screen.
+Layered, most-specific first:
+
+1. **Timeout-capable sensor bus**: every MCP9600 transaction is bounded —
+   a wedged or forever-stretching slave returns an error instead of
+   parking the loop. Readings become the wire's `0x8000` invalid sentinel
+   (logger shows `---`), and the sequence counter keeps advancing, so a
+   sick sensor can never zombie the pod.
+2. **Runtime recovery**: ~0.5 s of consecutive bus faults triggers a bus
+   clear + a Shutdown→Normal **mode-cycle reconfigure** (the chip's
+   nearest thing to a reset command), throttled to one attempt per 2 s —
+   the sensor is fixed in place, no reboot.
+3. **Watchdog**: the nRF52840 hardware **watchdog** (8 s) is armed first
+   thing at boot and fed once per `loop()` pass: a hang anywhere reboots
+   the pod within seconds (the original 2026-07-19 "zombie egg" incident
+   — a wedged sensor read left the radio beaconing a frozen payload for
+   hours). Boot's bus clears recover the wedged wires, and the sequence
+   counter restarting tells the logger's zombie detection the egg is live
+   again. A watchdog reboot is reported on serial (`!! WATCHDOG REBOOT`)
+   and as `WDT RESET` on the boot scan screen.
+4. **Fatal-boot retry**: a `FATAL` boot failure (probe absent) shows its
+   screen for 30 s, then hard-resets and retries, so a transient boot
+   glitch self-heals in the field.
 
 ## Libraries
 
-Adafruit MCP9600, Adafruit SSD1306 (or SH110X — `USE_SH1106` flag),
-Adafruit GFX, Adafruit BusIO; Bluefruit nRF52 comes with the Seeed XIAO
-nRF52840 board package.
+Adafruit SSD1306 (or SH110X — `USE_SH1106` flag), Adafruit GFX,
+Adafruit BusIO; Bluefruit nRF52 comes with the Seeed XIAO nRF52840 board
+package. The Adafruit MCP9600 library is no longer used — the sensor is
+driven by the in-repo `mcp9600.{h,cpp}` register driver over the
+timeout-capable `soft_i2c` bus (register codecs host-tested in
+`mcp9600_regs`).
 
 ## CI & tests
 
