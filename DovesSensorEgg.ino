@@ -2,7 +2,7 @@
    DovesSensorEgg - wireless EGT pod (PW-ADV-1 broadcaster)
    XIAO nRF52840 + Adafruit MCP9600 + I2C OLED + button
 
-   Boot -> scan I2C -> border test -> BLE up (MAC shown) -> live temp on
+   Boot -> bird splash -> scan I2C -> BLE up (MAC shown) -> live temp on
    screen + serial + BLE advertising.
 
    BLE: pure BROADCASTER. EGT + cold junction are packed into a 14-byte
@@ -20,8 +20,14 @@
    press wakes the chip, but boot goes straight back to sleep unless
    the button stays held - a pocket bump never lights the screen.
 
+   WIRING (changed 2026-07-20): the MCP9600 lives on its OWN bit-banged
+   I2C bus - SDA=D2, SCL=D3, ~50 kHz, 4.7k pullups recommended - so a
+   wedged sensor can't take the OLED down and every transaction has a
+   timeout (see soft_i2c.h). The OLED stays on hardware Wire (D4/D5),
+   now at 400 kHz. The Adafruit MCP9600 library is no longer used; the
+   register driver is mcp9600.{h,cpp} over the soft bus.
+
    Libraries (Arduino Library Manager):
-     Adafruit MCP9600
      Adafruit SH110X          (or Adafruit SSD1306 if you flip USE_SH1106 to 0)
      Adafruit GFX Library     <- must be current; SH110X needs Adafruit_GrayOLED
      Adafruit BusIO
@@ -29,12 +35,16 @@
    ========================================================================== */
 
 #include <Wire.h>
-#include <Adafruit_MCP9600.h>
 #include <bluefruit.h>
+#include <avr/dtostrf.h>     // dtostrf() needs its own header on this core
 
+#include "images.h"          // boot splash (the bird, from DovesDataLogger)
 #include "pw_adv_encode.h"   // PW-ADV-1 payload builder (host-tested)
+#include "soft_i2c.h"        // timeout-capable bit-banged bus (MCP9600)
+#include "mcp9600.h"         // register driver over the soft bus
+#include "mcp9600_regs.h"    // host-tested register codecs
 
-// ---- SCREEN DRIVER: flip this if the boot border test looks wrong ----------
+// ---- SCREEN DRIVER: flip this if the boot splash geometry looks wrong ------
 #define USE_SH1106   0        // 1 = SH1106 (1.3")    0 = SSD1306 (0.96")
 #define OLED_W     128
 #define OLED_H      64
@@ -57,7 +67,11 @@
 #endif
 
 #define BTN_PIN     D1
-#define READ_MS    100        // MCP @16-bit converts in 80ms
+// MCP9600's dedicated soft bus (see header note). D2/D3 are free pins:
+// D1 = button, D4/D5 = hardware Wire (OLED).
+#define MCP_SDA_PIN D2
+#define MCP_SCL_PIN D3
+#define READ_MS    100        // MCP @16-bit converts in ~63-80ms
 #define ADV_MS     250        // payload rebuild tick (see ADV_INTERVAL_UNITS)
 #define DRAW_MS    200
 #define SERIAL_MS  250
@@ -88,7 +102,10 @@
 //   5    flags (bit0 pairing, bit1 TC fault)
 //   6-7  EGT int16 deci-degC  8-9  CJ int16 deci-degC
 //   10   raw MCP9600 STATUS   11   battery stub FF    12-13 sequence
-Adafruit_MCP9600 mcp;
+SoftI2C mcpBus = {MCP_SDA_PIN, MCP_SCL_PIN,
+                  /*halfPeriodUs=*/10,      // ~50 kHz: slow on purpose (EMI margin)
+                  /*stretchTimeoutUs=*/5000};
+Mcp9600 mcp;
 
 uint8_t  mcpAddr  = 0;
 uint8_t  oledAddr = 0;
@@ -175,7 +192,7 @@ void systemOff() {
 void enterDeepSleep() {
   Serial.println("deep sleep - hold button 5 s to wake");
   Bluefruit.Advertising.stop();
-  if (mcpAddr) mcp.enable(false);          // MCP9600 shutdown (~uA)
+  mcpShutdown(mcp);                        // MCP9600 shutdown mode (~uA)
   if (oledOK) {
     oled.clearDisplay();
     oled.display();
@@ -226,37 +243,20 @@ void i2cBusClear() {
   pinMode(SCL, INPUT_PULLUP);
 }
 
-// -------------------------------------------------- I2C bus scan
+// -------------------------------------------------- OLED probe (Wire)
+// OLED only. The MCP9600 is NOT probed here anymore: blind START/STOP
+// probes are exactly what community experience says can confuse its
+// interface state machine, and it now lives on its own bus with a
+// proper ID handshake (mcpDetect). A bare probe is fine for the SSD1306.
 void scanBus() {
-  Serial.println("\n--- I2C scan ---");
-  uint8_t n = 0;
-  for (uint8_t a = 0x08; a < 0x78; a++) {
+  Serial.println("\n--- OLED probe (Wire) ---");
+  for (uint8_t a = 0x3C; a <= 0x3D; a++) {
     Wire.beginTransmission(a);
     if (Wire.endTransmission() != 0) continue;
-    n++;
-    Serial.print("  0x"); Serial.print(a, HEX);
-    if (a == 0x3C || a == 0x3D) {
-      Serial.print("   <- OLED");
-      if (!oledAddr) oledAddr = a;
-    } else if (a >= 0x60 && a <= 0x67) {
-      Serial.print("   <- MCP9600");
-      if (!mcpAddr) mcpAddr = a;
-    }
-    Serial.println();
+    Serial.print("  OLED at 0x"); Serial.println(a, HEX);
+    if (!oledAddr) oledAddr = a;
   }
-  if (n == 0) Serial.println("  NOTHING FOUND -> check SDA=D4, SCL=D5, 3V3, GND");
-  Serial.print("--- "); Serial.print(n); Serial.println(" device(s) ---\n");
-}
-
-// -------------------------------------------------- raw STATUS read (reg 0x04)
-// Done by hand instead of mcp.getStatus() so it compiles on any lib version.
-uint8_t mcpStatus() {
-  if (!mcpAddr) return 0xFF;
-  Wire.beginTransmission(mcpAddr);
-  Wire.write(0x04);
-  if (Wire.endTransmission(false) != 0) return 0xFF;
-  if (Wire.requestFrom(mcpAddr, (uint8_t)1) != 1) return 0xFF;
-  return Wire.read();
+  if (!oledAddr) Serial.println("  no OLED -> serial only");
 }
 
 // -------------------------------------------------- debounced button
@@ -379,23 +379,6 @@ void fatal(const char* msg) {
   }
 }
 
-// -------------------------------------------------- boot border test
-// Correct driver  -> border hugs all four edges, X hits all four corners.
-// Wrong driver    -> 2px gap one side, clipped/noisy stripe the other.
-void borderTest() {
-  oled.clearDisplay();
-  oled.drawRect(0, 0, OLED_W, OLED_H, PX_ON);
-  oled.drawLine(0, 0, OLED_W - 1, OLED_H - 1, PX_ON);
-  oled.drawLine(OLED_W - 1, 0, 0, OLED_H - 1, PX_ON);
-  oled.setTextSize(1);
-  oled.setTextColor(PX_ON, PX_OFF);
-  oled.setCursor(40, 28);
-  oled.print(DRV_NAME);
-  oled.display();
-  delay(2500);
-  wdtPet();  // 2.5 s hold — stay inside the watchdog window
-}
-
 // -------------------------------------------------- sleep countdown screen
 void drawSleepCountdown(uint32_t secondsLeft) {
   if (!oledOK) return;
@@ -419,29 +402,53 @@ void drawScreen(float egtC, float cjC, uint8_t st) {
   oled.clearDisplay();
   oled.setTextColor(PX_ON, PX_OFF);
 
+  // Bicolor panel: rows 0-15 are the yellow band. Header = the info:
+  // address, data-ready (STATUS bit6), probe fault (STATUS bit4), and the
+  // advertising packet counter (right-aligned). The scale lives on the CJ
+  // line. 0xFF status = bus fault -> flags unknown, don't fake health.
+  const bool stValid = (st != 0xFF);
   oled.setTextSize(1);
-  oled.setCursor(0, 0);
-  oled.print("EGT @0x"); oled.print(mcpAddr, HEX);
-  oled.setCursor(OLED_W - 6, 0);
-  oled.print(showF ? "F" : "C");
+  oled.setCursor(0, 4);
+  oled.print("0x"); oled.print(mcpAddr, HEX);
+  oled.setCursor(36, 4);
+  oled.print((stValid && (st & 0x40)) ? "RDY" : "--");
+  oled.setCursor(66, 4);
+  oled.print(!stValid ? "?" : ((st & 0x10) ? "OPEN" : "OK"));
+  char seqStr[8];
+  snprintf(seqStr, sizeof(seqStr), "#%u", (unsigned)advSeq);
+  oled.setCursor(OLED_W - 6 * (int16_t)strlen(seqStr), 4);
+  oled.print(seqStr);
 
-  oled.setTextSize(3);
-  oled.setCursor(0, 14);
-  if (isnan(egt)) oled.print("---");
-  else            oled.print(egt, 1);
+  // Blue: just the temperatures, centered. Widths are computed from the
+  // formatted strings (dtostrf — this core's printf lacks reliable %f).
+  char numBuf[12];
+  char lineBuf[20];
+  if (isnan(egt)) {
+    snprintf(lineBuf, sizeof(lineBuf), "---");
+  } else {
+    dtostrf(egt, 1, 1, numBuf);
+    snprintf(lineBuf, sizeof(lineBuf), "%s", numBuf);
+  }
+  oled.setTextSize(3);  // 18 px per glyph
+  oled.setCursor((OLED_W - 18 * (int16_t)strlen(lineBuf)) / 2, 20);
+  oled.print(lineBuf);
 
-  oled.setTextSize(1);
-  oled.setCursor(0, 42);
-  oled.print("CJ "); oled.print(cj, 1); oled.print(showF ? " F" : " C");
+  if (isnan(cj)) {
+    snprintf(lineBuf, sizeof(lineBuf), "CJ ---");
+  } else {
+    dtostrf(cj, 1, 1, numBuf);
+    snprintf(lineBuf, sizeof(lineBuf), "CJ %s %c", numBuf, showF ? 'F' : 'C');
+  }
+  oled.setTextSize(1);  // 6 px per glyph
+  oled.setCursor((OLED_W - 6 * (int16_t)strlen(lineBuf)) / 2, 50);
+  oled.print(lineBuf);
 
-  oled.setCursor(0, 54);
-  oled.print("ST ");
-  if (st < 0x10) oled.print("0");
-  oled.print(st, HEX);
-  if (st & 0x10) oled.print(" OPEN?");
-  oled.print(" #"); oled.print(advSeq);         // adv sequence counter
-  if (!advOK)               oled.print(" ADV!"); // last adv restart failed
-  else if (millis() < pairUntil) oled.print(" PAIR");
+  // Transient states borrow the bottom-right corner (normally blank).
+  if (!advOK) {
+    oled.setCursor(OLED_W - 24, 56); oled.print("ADV!");
+  } else if (millis() < pairUntil) {
+    oled.setCursor(OLED_W - 24, 56); oled.print("PAIR");
+  }
 
   oled.display();
 }
@@ -475,11 +482,10 @@ void setup() {
 
   i2cBusClear();               // recover a slave wedged by a mid-read reset
   Wire.begin();
-  // 100 kHz, not 400: the MCP9600's I2C tops out at 100 kHz per datasheet
-  // (it also clock-stretches). 400 kHz ACKs the address scan but the
-  // multi-byte register reads - begin()'s device-ID check first - are
-  // marginal and fail intermittently. The OLED doesn't care.
-  Wire.setClock(100000);
+  // 400 kHz: the OLED is alone on this bus now. (It was pinned to 100 kHz
+  // only because the clock-stretching MCP9600 shared it — that constraint
+  // moved to the dedicated soft bus along with the chip.)
+  Wire.setClock(400000);
   delay(100);
   scanBus();
 
@@ -495,8 +501,34 @@ void setup() {
     Serial.println("no OLED on bus - serial only");
   }
 
+  // MCP9600 on its own timeout-capable soft bus: proper ID handshake at
+  // each candidate address (retried — a mid-conversion NACK is normal and
+  // must never read as "absent"), never a blind probe.
+  softI2cBegin(mcpBus);
+  softI2cBusClear(mcpBus);
+  mcp.bus = &mcpBus;
+
+  bool mcpOK = false;
+  for (int attempt = 1; attempt <= 3 && !mcpOK; attempt++) {
+    mcpOK = mcpDetect(mcp, /*triesPerAddr=*/3, /*gapMs=*/20);
+    if (!mcpOK) {
+      Serial.print("MCP detect attempt "); Serial.print(attempt);
+      Serial.println(" failed (soft bus D2/D3)");
+      softI2cBusClear(mcpBus);
+      delay(200);
+    }
+    wdtPet();
+  }
+  mcpAddr = mcp.addr;
+
   if (oledOK) {
-    borderTest();
+    // Boot splash — the bird, same art as the datalogger.
+    oled.clearDisplay();
+    oled.drawBitmap(0, 0, image_data_bird1, 128, 64, PX_ON);
+    oled.display();
+    delay(2500);
+    wdtPet();  // 2.5 s hold — stay inside the watchdog window
+
     oled.clearDisplay();
     oled.setTextSize(1); oled.setTextColor(PX_ON, PX_OFF);
     oled.setCursor(0, 0);  oled.print("I2C SCAN");
@@ -510,37 +542,21 @@ void setup() {
     wdtPet();
   }
 
-  if (!mcpAddr) fatal("MCP not on bus");
+  if (!mcpOK) fatal("MCP not on bus");
 
-  // begin() = the device-ID read at reg 0x20 (expects 0x40/0x41 in the
-  // high byte). Retry a few times - the MCP9600 is slow to wake and can
-  // need a moment after a bus clear - and dump the raw ID on failure so
-  // a bad read is distinguishable from a wrong/absent chip.
-  bool mcpOK = false;
-  for (int attempt = 1; attempt <= 5 && !mcpOK; attempt++) {
-    mcpOK = mcp.begin(mcpAddr);
-    if (!mcpOK) {
-      Serial.print("MCP begin() attempt "); Serial.print(attempt);
-      Serial.print(" failed, ID reg 0x20 = 0x");
-      Wire.beginTransmission(mcpAddr);
-      Wire.write(0x20);
-      Wire.endTransmission(false);
-      if (Wire.requestFrom(mcpAddr, (uint8_t)2) == 2) {
-        Serial.print(Wire.read(), HEX); Serial.print(" 0x");
-        Serial.println(Wire.read(), HEX);
-      } else {
-        Serial.println("<read failed>");
-      }
-      delay(200);
-      wdtPet();
+  // Mode-cycle (Shutdown -> Normal, the chip's nearest thing to a reset
+  // command) + full config with read-back verify.
+  bool cfgOK = false;
+  for (int attempt = 1; attempt <= 3 && !cfgOK; attempt++) {
+    cfgOK = mcpModeCycle(mcp);
+    if (!cfgOK) {
+      Serial.print("MCP config attempt "); Serial.print(attempt);
+      Serial.println(" failed");
+      delay(100);
     }
+    wdtPet();
   }
-  if (!mcpOK) fatal("MCP begin() fail");
-
-  mcp.setThermocoupleType(MCP9600_TYPE_K);
-  mcp.setADCresolution(MCP9600_ADCRESOLUTION_16);   // 80ms. NOT the 18-bit default.
-  mcp.setFilterCoefficient(3);
-  mcp.enable(true);
+  if (!cfgOK) fatal("MCP config fail");
 
   Serial.print("MCP9600 up @0x"); Serial.println(mcpAddr, HEX);
 
@@ -584,10 +600,34 @@ void loop() {
 
   if (millis() - tRead >= READ_MS) {
     tRead = millis();
-    egtC  = mcp.readThermocouple();
-    cjC   = mcp.readAmbient();
-    st    = mcpStatus();
+    egtC  = mcpReadHotC(mcp);    // NaN on any bus fault — never stale data
+    cjC   = mcpReadColdC(mcp);
+    st    = mcpReadStatus(mcp);  // 0xFF on fault (sets the TC-fault flag)
     nRead++;
+
+    // Runtime recovery: the soft bus's timeouts turn a wedge into an error
+    // we can SEE, so a sick sensor gets fixed in place instead of waiting
+    // for the WDT. ~0.5 s of consecutive faults -> bus clear + mode-cycle
+    // reconfigure (the chip's "reset"), throttled to one attempt per 2 s.
+    // Meanwhile the payload keeps broadcasting the 0x8000 sentinel and the
+    // sequence counter keeps advancing — the pod can never zombie again.
+    static uint8_t  mcpFaultRun = 0;
+    static uint32_t tRecover    = 0;
+    const bool faulted = isnan(egtC) && isnan(cjC);
+    if (!faulted) {
+      mcpFaultRun = 0;
+    } else if (mcpFaultRun < 255) {
+      mcpFaultRun++;
+    }
+    if (mcpFaultRun >= 5 && millis() - tRecover >= 2000) {
+      tRecover = millis();
+      Serial.println("MCP fault run -> bus clear + mode cycle");
+      softI2cBusClear(mcpBus);
+      if (mcpModeCycle(mcp)) {
+        Serial.println("MCP recovered in place");
+        mcpFaultRun = 0;
+      }
+    }
   }
 
   // Payload rebuild on its own slower tick, so between rebuilds the
