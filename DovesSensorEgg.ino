@@ -19,6 +19,17 @@
    enclosure has no power switch). Wake = hold the button 5 s: the
    press wakes the chip, but boot goes straight back to sleep unless
    the button stays held - a pocket bump never lights the screen.
+   Deep sleep needs USB UNPLUGGED: the nRF52840 cannot hold System OFF
+   with bus power present, it just resets.
+
+   NOTHING IN BRING-UP REBOOTS THE POD (2026-07-26). A missing or
+   unhealthy MCP9600 boots degraded - radio and screen up, readings on
+   the wire's invalid sentinel, sensor retried by loop()'s recovery tick
+   - because rebooting is the one recovery that cannot fix a failing
+   boot. If the pod resets BOOT_SAFE_AFTER times anyway without a
+   healthy run in between, it comes up in SAFE MODE: watchdog held off
+   until loop() is running, boot screens and deep sleep disabled. See
+   the boot-loop breaker note below.
 
    WIRING (changed 2026-07-20): the MCP9600 lives on its OWN bit-banged
    I2C bus - SDA=D2, SCL=D3, ~50 kHz, 4.7k pullups recommended - so a
@@ -93,6 +104,36 @@
 #define SLEEP_HOLD_MS 10000   // button held this long -> deep sleep
 #define WAKE_HOLD_MS   5000   // wake press must be HELD this long to boot
 #define SLEEP_HINT_MS  2000   // hold this long -> on-screen sleep countdown
+#define BTN_STABLE_MS    16   // button level must hold this long to count
+
+// ---- boot-loop breaker ----------------------------------------------------
+// Boot-loop incident (2026-07-26): the pod rebooted forever after a flash
+// and only DFU mode could stop it. Three separate reboot paths had been
+// added with nothing to break the cycle they formed:
+//   * fatal() hard-reset every 30 s, so an MCP9600 that missed its boot
+//     handshake rebooted the pod for as long as it stayed missing;
+//   * wakeHoldGate() sampled the button ONCE, undebounced, so a bouncing
+//     wake press re-entered System OFF mid-press, re-triggered SENSE-LOW
+//     and looped at boot speed with nothing ever drawn;
+//   * System OFF with USB VBUS present, which the nRF52840 cannot hold —
+//     it wakes and resets immediately.
+// All three are fixed at the source below, but the pod also needs to be
+// able to break ANY future cycle on its own, including one we haven't
+// thought of. GPREGRET2 survives every warm reset (watchdog, soft reset,
+// pin reset) and System OFF, and is cleared by a real power cycle; the
+// Adafruit bootloader owns GPREGRET for the DFU magic and never touches
+// GPREGRET2. Boot increments a counter there; a run that stays healthy
+// for BOOT_HEALTHY_MS clears it. BOOT_SAFE_AFTER boots without a healthy
+// run in between means something in bring-up is cycling, so the pod comes
+// up in SAFE MODE: no watchdog until loop() is actually running, no boot
+// delays, no deep-sleep gate, everything optional skipped. Safe mode is
+// deliberately boring — the point is a pod that sits still, holds its USB
+// enumeration and can be re-flashed without the DFU dance.
+#define BOOT_TAG_MASK    0xF0
+#define BOOT_TAG_VALUE   0xB0  // canary: our counter vs. power-on garbage
+#define BOOT_COUNT_MASK  0x0F
+#define BOOT_SAFE_AFTER  3     // boots with no healthy run -> safe mode
+#define BOOT_HEALTHY_MS  15000 // loop() alive this long -> the boot "took"
 
 // ---- PW-ADV-1 payload (14 bytes, little-endian fields) --------------------
 // Bluefruit's addManufacturerData() passes the buffer through RAW - it does
@@ -107,11 +148,13 @@ SoftI2C mcpBus = {MCP_SDA_PIN, MCP_SCL_PIN,
                   /*stretchTimeoutUs=*/5000};
 Mcp9600 mcp;
 
-uint8_t  mcpAddr  = 0;
 uint8_t  oledAddr = 0;
 bool     oledOK   = false;
 bool     showF    = true;
 uint32_t nRead    = 0;
+
+bool     safeMode  = false;   // boot-loop breaker tripped (see BOOT_* above)
+uint8_t  bootCount = 0;       // consecutive boots without a healthy run
 
 uint16_t advSeq    = 0;
 uint32_t pairUntil = 0;       // millis deadline; 0 = pairing window closed
@@ -135,8 +178,13 @@ using pw_adv::c2f;
 // recovery a wedged bus needs, and the sequence counter restarting from 0
 // is how the logger's zombie detection sees the egg come back to life.
 // Once started the WDT cannot be stopped or re-configured.
-#define WDT_TIMEOUT_S   8      // generous: setup()'s info screens take ~7 s
-#define FATAL_REBOOT_MS 30000  // fatal() shows its screen this long, then retries
+//
+// In SAFE MODE the watchdog is NOT armed until loop() is running. A pod
+// that is already cycling must not be rebooted again by the very timer
+// meant to protect a healthy run — an un-armed watchdog turns a bring-up
+// hang into a device that sits still, keeps its USB enumeration and can
+// be re-flashed, instead of one that loops out of reach.
+#define WDT_TIMEOUT_S   8      // bring-up feeds through bootDelay(), see below
 
 void wdtSetup() {
   NRF_WDT->CONFIG = WDT_CONFIG_SLEEP_Run << WDT_CONFIG_SLEEP_Pos;
@@ -145,7 +193,22 @@ void wdtSetup() {
   NRF_WDT->TASKS_START = 1;
 }
 
+// Harmless before TASKS_START — a stopped watchdog ignores the reload.
 void wdtPet() { NRF_WDT->RR[0] = WDT_RR_RR_Reload; }
+
+// Every deliberate wait in bring-up goes through here instead of delay():
+// the feed comes with the wait, so no hand-placed wdtPet() can be missed
+// or drift out of range when a boot screen grows. Bring-up is the one
+// place the pod blocks for seconds at a time, and a missed feed there is
+// a permanent boot loop, not a one-off reboot.
+void bootDelay(uint32_t ms) {
+  const uint32_t t0 = millis();
+  while (millis() - t0 < ms) {
+    wdtPet();
+    delay(10);
+  }
+  wdtPet();
+}
 
 // Read + clear the sticky reset-reason register. Callers test the bits:
 // DOG = previous run hung and the watchdog rebooted it; OFF = a GPIO
@@ -154,6 +217,80 @@ uint32_t captureResetReason() {
   uint32_t rr = NRF_POWER->RESETREAS;
   NRF_POWER->RESETREAS = rr;   // sticky until written — clear for next boot
   return rr;
+}
+
+// -------------------------------------------------- restricted registers
+// NRF_POWER is restricted once the SoftDevice is enabled, so both helpers
+// dispatch the same way systemOff() already does.
+bool sdEnabled() {
+  uint8_t on = 0;
+  (void)sd_softdevice_is_enabled(&on);
+  return on != 0;
+}
+
+// True when USB bus power is present. The nRF52840 CANNOT hold System OFF
+// with VBUS up: the USB regulator wakes it straight back out and the pod
+// resets instead of sleeping. Every sleep path checks this first.
+bool vbusPresent() {
+  uint32_t status = 0;
+  if (sdEnabled()) {
+    if (sd_power_usbregstatus_get(&status) != NRF_SUCCESS) return false;
+  } else {
+    status = NRF_POWER->USBREGSTATUS;
+  }
+  return (status & POWER_USBREGSTATUS_VBUSDETECT_Msk) != 0;
+}
+
+// -------------------------------------------------- boot-loop counter
+uint8_t bootRegGet() {
+  uint32_t v = 0;
+  if (sdEnabled()) { (void)sd_power_gpregret_get(1, &v); }
+  else             { v = NRF_POWER->GPREGRET2; }
+  return (uint8_t)v;
+}
+
+void bootRegSet(uint8_t v) {
+  if (sdEnabled()) {
+    (void)sd_power_gpregret_clr(1, 0xFF);
+    (void)sd_power_gpregret_set(1, v);
+  } else {
+    NRF_POWER->GPREGRET2 = v;
+  }
+}
+
+// Count this boot. Returns the number of consecutive boots that have not
+// yet been confirmed healthy (1 = this is the first).
+uint8_t bootCountBump() {
+  const uint8_t reg = bootRegGet();
+  uint8_t n = ((reg & BOOT_TAG_MASK) == BOOT_TAG_VALUE) ? (reg & BOOT_COUNT_MASK) : 0;
+  if (n < BOOT_COUNT_MASK) n++;
+  bootRegSet((uint8_t)(BOOT_TAG_VALUE | n));
+  return n;
+}
+
+// The run stuck: forget the streak so the next boot starts clean.
+void bootCountClear() { bootRegSet(BOOT_TAG_VALUE); }
+
+// -------------------------------------------------- debounced button level
+// A single digitalRead() is not enough to decide anything that reboots the
+// pod: the contact bounces for milliseconds and the internal ~13 k pull-up
+// needs a beat to pull the line up after pinMode(). The undebounced read in
+// the old wakeHoldGate() is exactly how a wake press turned into a System
+// OFF <-> wake ping-pong. (btnEvent() below keeps its own edge debounce for
+// the C/F and pairing presses — those decide nothing that costs a reboot.)
+bool btnReleasedStable() {
+  const uint32_t t0 = millis();
+  while (millis() - t0 < BTN_STABLE_MS) {
+    if (digitalRead(BTN_PIN) == LOW) return false;
+    delay(1);
+  }
+  return true;
+}
+
+// Block until the button has been released and stayed released. Fed, so a
+// button held (or stuck) forever is the watchdog's problem, not a hang.
+void btnWaitRelease() {
+  while (!btnReleasedStable()) { wdtPet(); delay(10); }
 }
 
 // -------------------------------------------------- deep sleep (System OFF)
@@ -174,9 +311,7 @@ void systemOff() {
   NVIC_ClearPendingIRQ(FPU_IRQn);
   // NRF_POWER is restricted while the SoftDevice is enabled (it is, once
   // bleSetup() has run — but the early wake-hold gate sleeps before that).
-  uint8_t sdEnabled = 0;
-  (void)sd_softdevice_is_enabled(&sdEnabled);
-  if (sdEnabled) {
+  if (sdEnabled()) {
     sd_power_reset_reason_clr(0xFFFFFFFF);
     (void)sd_power_system_off();
   } else {
@@ -188,8 +323,27 @@ void systemOff() {
 }
 
 // Full teardown then System OFF: radio silent, MCP9600 in shutdown mode,
-// display dark. Does not return.
-void enterDeepSleep() {
+// display dark. Returns ONLY if USB bus power blocks System OFF.
+bool enterDeepSleep() {
+  // On USB, SYSTEMOFF is not sleep — the regulator wakes the chip straight
+  // back out and the pod resets. Refuse and say so rather than handing the
+  // user an unexplained reboot every time they hold the button on the bench.
+  if (vbusPresent()) {
+    Serial.println("USB power present - System OFF would reset instantly; staying awake");
+    if (oledOK) {
+      oled.clearDisplay();
+      oled.setTextSize(1); oled.setTextColor(PX_ON, PX_OFF);
+      oled.setCursor(0, 4);  oled.print("CAN'T SLEEP");
+      oled.setCursor(0, 26); oled.print("USB power is on.");
+      oled.setCursor(0, 40); oled.print("Unplug, then hold");
+      oled.setCursor(0, 52); oled.print("the button again.");
+      oled.display();
+    }
+    btnWaitRelease();
+    bootDelay(2000);
+    return false;
+  }
+
   Serial.println("deep sleep - hold button 5 s to wake");
   Bluefruit.Advertising.stop();
   mcpShutdown(mcp);                        // MCP9600 shutdown mode (~uA)
@@ -198,28 +352,41 @@ void enterDeepSleep() {
     oled.display();
     DISPLAY_OFF();
   }
-  // Held button = SENSE satisfied = instant re-wake; wait for release.
-  while (digitalRead(BTN_PIN) == LOW) { wdtPet(); delay(10); }
+  // Held button = SENSE satisfied = instant re-wake; wait for a release
+  // that has actually settled, or the press bounces us straight back up.
+  btnWaitRelease();
   delay(50);   // contact settle
   systemOff();
+  return true; // unreachable outside emulated System OFF
 }
 
 // System OFF button wake: require a deliberate WAKE_HOLD_MS hold before
 // booting. Released early -> straight back to sleep. Nothing is drawn and
 // no peripheral is touched, so a pocket bump never lights the screen.
+//
+// Every "released" decision here is debounced. The old version sampled the
+// pin once: one stray HIGH in the bounce of the wake press dropped the pod
+// back into System OFF while the button was still physically down, SENSE-LOW
+// fired again immediately, and the pod cycled at boot speed — no screen, no
+// USB, DFU the only way back in.
 void wakeHoldGate() {
+  // Woken while on USB: System OFF cannot hold anyway, so gating the boot
+  // on a 5 s hold would just reset in a circle. Boot normally.
+  if (vbusPresent()) return;
+
+  delay(20);   // pull-up settle + first bounce, before anything is decided
   const uint32_t t0 = millis();
-  while (digitalRead(BTN_PIN) == LOW) {
+  while (millis() - t0 < WAKE_HOLD_MS) {
     wdtPet();
-    if (millis() - t0 >= WAKE_HOLD_MS) {
-      // Confirmed. Swallow the rest of the hold so the press doesn't fall
-      // through into btnEvent() as a C/F toggle or pairing long-press.
-      while (digitalRead(BTN_PIN) == LOW) { wdtPet(); delay(10); }
-      return;
+    if (btnReleasedStable()) {
+      systemOff();   // genuinely let go — back to sleep
+      return;        // unreachable outside emulated System OFF
     }
     delay(10);
   }
-  systemOff();  // released early — back to sleep
+  // Confirmed hold. Swallow the rest of it so the press doesn't fall
+  // through into btnEvent() as a C/F toggle or pairing long-press.
+  btnWaitRelease();
 }
 
 // -------------------------------------------------- I2C bus clear
@@ -341,42 +508,45 @@ void bleSetup() {
            mac[5], mac[4], mac[3], mac[2], mac[1], mac[0]);
   Serial.print("BLE up, MAC "); Serial.println(macStr);
 
-  if (oledOK) {
+  if (oledOK && !safeMode) {
     oled.clearDisplay();
     oled.setTextSize(1); oled.setTextColor(PX_ON, PX_OFF);
     oled.setCursor(0, 0);  oled.print("BLE: PWEGT");
     oled.setCursor(0, 18); oled.print("MAC (for logger):");
     oled.setCursor(0, 32); oled.print(macStr);
     oled.display();
-    delay(3000);
-    wdtPet();  // 3 s hold — stay inside the watchdog window
+    bootDelay(3000);   // fed throughout — see bootDelay()
   }
 }
 
-// -------------------------------------------------- fatal halt
-// Shows the message long enough to read, then hard-resets and tries again:
-// a TRANSIENT boot failure (EMI glitch during the MCP probe, marginal
-// battery sag) self-heals instead of bricking the pod for the day, while a
-// permanent fault (probe genuinely absent) still shows a readable screen
-// 30 s out of every retry cycle. The WDT is fed while the screen is up —
-// this halt is deliberate, not a hang.
-void fatal(const char* msg) {
-  Serial.print("FATAL: "); Serial.println(msg);
-  const uint32_t t0 = millis();
-  while (1) {
-    wdtPet();
-    if (oledOK) {
-      oled.clearDisplay();
-      oled.setTextSize(2); oled.setTextColor(PX_ON, PX_OFF);
-      oled.setCursor(0, 0);  oled.print("FATAL");
-      oled.setTextSize(1);
-      oled.setCursor(0, 24); oled.print(msg);
-      oled.setCursor(0, 54); oled.print("retrying in 30s");
-      oled.display();
-    }
-    delay(1000);
-    if (millis() - t0 >= FATAL_REBOOT_MS) NVIC_SystemReset();
+// -------------------------------------------------- sensor bring-up failure
+// NOT fatal, and deliberately NOT a reboot. The old fatal() hard-reset the
+// pod every 30 s until the MCP9600 answered, which is a boot loop whenever
+// the sensor is absent, mis-wired or just slow to come back — and rebooting
+// is the one recovery that cannot possibly help, because boot is what keeps
+// failing. It also made the pod near-impossible to re-flash: the USB CDC
+// port vanished every 30 s.
+//
+// Everything the reboot was supposed to buy already exists further down:
+// reads return the 0x8000 wire sentinel (logger shows "---", never a stale
+// value), and loop()'s recovery path re-runs the bus clear, the detect and
+// the mode-cycle every 2 s for as long as the fault lasts. So boot through
+// it: radio up, screen up, sensor marked absent and retried in place.
+void sensorFailed(const char* msg) {
+  Serial.print("SENSOR FAULT: "); Serial.println(msg);
+  Serial.println("booting degraded - EGT reports invalid, runtime recovery keeps retrying");
+  mcp.addr = 0;                 // reads -> NaN / 0xFF -> wire sentinel
+  if (oledOK) {
+    oled.clearDisplay();
+    oled.setTextSize(2); oled.setTextColor(PX_ON, PX_OFF);
+    oled.setCursor(0, 0);  oled.print("NO SENSOR");
+    oled.setTextSize(1);
+    oled.setCursor(0, 24); oled.print(msg);
+    oled.setCursor(0, 40); oled.print("check MCP9600 on");
+    oled.setCursor(0, 52); oled.print("D2/D3 - retrying");
+    oled.display();
   }
+  bootDelay(3000);
 }
 
 // -------------------------------------------------- sleep countdown screen
@@ -409,7 +579,8 @@ void drawScreen(float egtC, float cjC, uint8_t st) {
   const bool stValid = (st != 0xFF);
   oled.setTextSize(1);
   oled.setCursor(0, 4);
-  oled.print("0x"); oled.print(mcpAddr, HEX);
+  if (mcp.addr) { oled.print("0x"); oled.print(mcp.addr, HEX); }
+  else            oled.print("--");
   oled.setCursor(36, 4);
   oled.print((stValid && (st & 0x40)) ? "RDY" : "--");
   oled.setCursor(66, 4);
@@ -444,7 +615,11 @@ void drawScreen(float egtC, float cjC, uint8_t st) {
   oled.print(lineBuf);
 
   // Transient states borrow the bottom-right corner (normally blank).
-  if (!advOK) {
+  // SAFE outranks the others: it says the pod broke a boot loop to get
+  // here, which the user needs to see for longer than a pairing window.
+  if (safeMode) {
+    oled.setCursor(OLED_W - 24, 56); oled.print("SAFE");
+  } else if (!advOK) {
     oled.setCursor(OLED_W - 24, 56); oled.print("ADV!");
   } else if (millis() < pairUntil) {
     oled.setCursor(OLED_W - 24, 56); oled.print("PAIR");
@@ -455,29 +630,49 @@ void drawScreen(float egtC, float cjC, uint8_t st) {
 
 // -------------------------------------------------- setup
 void setup() {
-  // Reset-cause first (the register is sticky), THEN arm the WDT — from
-  // here on a hang anywhere reboots the pod instead of zombifying it.
+  // Reset-cause first (the register is sticky), then count the boot, THEN
+  // decide whether to arm the WDT. Order matters: the counter has to be
+  // bumped before anything that could hang, or a cycle never gets counted
+  // and never trips safe mode.
   const uint32_t resetReas = captureResetReason();
   const bool wdtReboot = (resetReas & POWER_RESETREAS_DOG_Msk) != 0;
   const bool offWake   = (resetReas & POWER_RESETREAS_OFF_Msk) != 0;
-  wdtSetup();
+
+  bootCount = bootCountBump();
+  safeMode  = bootCount >= BOOT_SAFE_AFTER;
+
+  // Healthy boot: arm the watchdog first thing, so a hang anywhere reboots
+  // the pod instead of zombifying it. Safe mode defers it to loop() — see
+  // the note by WDT_TIMEOUT_S.
+  if (!safeMode) wdtSetup();
 
   pinMode(BTN_PIN, INPUT_PULLUP);
+  delay(5);   // let the internal pull-up actually pull the line up
 
   // Woken out of deep sleep by the button: demand the 5 s hold before
   // anything else powers up. (A watchdog reboot skips this — after a hang
-  // the pod must come back broadcasting without a human.)
-  if (offWake) wakeHoldGate();
+  // the pod must come back broadcasting without a human. So does safe
+  // mode: the sleep path is itself a reboot path, and a pod that is
+  // already cycling must not be handed another way to go dark.)
+  if (offWake && !wdtReboot && !safeMode) wakeHoldGate();
 
   Serial.begin(115200);
-  while (!Serial && millis() < 3000) { }     // don't block forever on battery
+  while (!Serial && millis() < 3000) { wdtPet(); }  // don't block on battery
 
   Serial.println("\nDovesSensorEgg - wireless EGT pod (PW-ADV-1)");
+  Serial.print("boot #"); Serial.print(bootCount);
+  Serial.print(" since last healthy run, RESETREAS 0x");
+  Serial.println(resetReas, HEX);
   if (wdtReboot) {
     // The previous run hung (I2C wedge under ignition EMI is the known
     // suspect) and the watchdog pulled us out. The i2cBusClear() below is
     // exactly the recovery that wedge needs.
     Serial.println("!! WATCHDOG REBOOT - previous run hung");
+  }
+  if (safeMode) {
+    Serial.println("!! SAFE MODE - repeated reboots without a healthy run.");
+    Serial.println("   Watchdog held off, boot screens skipped, sleep disabled.");
+    Serial.println("   Power-cycle after a good run to clear.");
   }
 
   i2cBusClear();               // recover a slave wedged by a mid-read reset
@@ -508,57 +703,73 @@ void setup() {
   softI2cBusClear(mcpBus);
   mcp.bus = &mcpBus;
 
+  // Safe mode does one quick pass instead of three retried ones: bring-up
+  // is what keeps failing, so it gets the shortest path to loop(), where
+  // the recovery tick retries the sensor anyway.
+  const int detectAttempts = safeMode ? 1 : 3;
   bool mcpOK = false;
-  for (int attempt = 1; attempt <= 3 && !mcpOK; attempt++) {
-    mcpOK = mcpDetect(mcp, /*triesPerAddr=*/3, /*gapMs=*/20);
+  for (int attempt = 1; attempt <= detectAttempts && !mcpOK; attempt++) {
+    mcpOK = mcpDetect(mcp, /*triesPerAddr=*/safeMode ? 1 : 3, /*gapMs=*/20);
     if (!mcpOK) {
       Serial.print("MCP detect attempt "); Serial.print(attempt);
       Serial.println(" failed (soft bus D2/D3)");
       softI2cBusClear(mcpBus);
-      delay(200);
+      bootDelay(200);
     }
     wdtPet();
   }
-  mcpAddr = mcp.addr;
 
-  if (oledOK) {
+  // The boot screens are ~7.5 s of blocking bring-up. Safe mode skips them
+  // outright — they are the longest stretch where a wedged OLED bus can
+  // park the pod, and nothing on them is worth another cycle.
+  if (oledOK && !safeMode) {
     // Boot splash — the bird, same art as the datalogger.
     oled.clearDisplay();
     oled.drawBitmap(0, 0, image_data_bird1, 128, 64, PX_ON);
     oled.display();
-    delay(2500);
-    wdtPet();  // 2.5 s hold — stay inside the watchdog window
+    bootDelay(2500);
 
     oled.clearDisplay();
     oled.setTextSize(1); oled.setTextColor(PX_ON, PX_OFF);
     oled.setCursor(0, 0);  oled.print("I2C SCAN");
     oled.setCursor(0, 18); oled.print("OLED 0x"); oled.print(oledAddr, HEX);
     oled.setCursor(0, 32); oled.print("MCP  ");
-    if (mcpAddr) { oled.print("0x"); oled.print(mcpAddr, HEX); }
-    else           oled.print("NOT FOUND");
+    if (mcp.addr) { oled.print("0x"); oled.print(mcp.addr, HEX); }
+    else            oled.print("NOT FOUND");
     if (wdtReboot) { oled.setCursor(0, 54); oled.print("WDT RESET"); }
     oled.display();
-    delay(2000);
-    wdtPet();
+    bootDelay(2000);
+  } else if (oledOK) {
+    oled.clearDisplay();
+    oled.setTextSize(1); oled.setTextColor(PX_ON, PX_OFF);
+    oled.setCursor(0, 0);  oled.print("SAFE MODE");
+    oled.setCursor(0, 18); oled.print("boot #"); oled.print(bootCount);
+    oled.setCursor(0, 32); oled.print("RESETREAS 0x");
+    oled.print(resetReas, HEX);
+    oled.setCursor(0, 50); oled.print("no WDT, no sleep");
+    oled.display();
+    bootDelay(2000);
   }
-
-  if (!mcpOK) fatal("MCP not on bus");
 
   // Mode-cycle (Shutdown -> Normal, the chip's nearest thing to a reset
   // command) + full config with read-back verify.
   bool cfgOK = false;
-  for (int attempt = 1; attempt <= 3 && !cfgOK; attempt++) {
-    cfgOK = mcpModeCycle(mcp);
-    if (!cfgOK) {
-      Serial.print("MCP config attempt "); Serial.print(attempt);
-      Serial.println(" failed");
-      delay(100);
+  if (mcpOK) {
+    for (int attempt = 1; attempt <= 3 && !cfgOK; attempt++) {
+      cfgOK = mcpModeCycle(mcp);
+      if (!cfgOK) {
+        Serial.print("MCP config attempt "); Serial.print(attempt);
+        Serial.println(" failed");
+        bootDelay(100);
+      }
+      wdtPet();
     }
-    wdtPet();
   }
-  if (!cfgOK) fatal("MCP config fail");
 
-  Serial.print("MCP9600 up @0x"); Serial.println(mcpAddr, HEX);
+  // Neither of these reboots any more — see sensorFailed().
+  if (!mcpOK)       sensorFailed("not on bus");
+  else if (!cfgOK)  sensorFailed("config failed");
+  else { Serial.print("MCP9600 up @0x"); Serial.println(mcp.addr, HEX); }
 
   bleSetup();
 
@@ -568,6 +779,27 @@ void setup() {
 // -------------------------------------------------- loop
 void loop() {
   wdtPet();  // sole feed point: a wedge ANYWHERE below reboots the pod
+
+  // Safe mode deferred arming the watchdog until bring-up was survived —
+  // now that we are actually looping, it is safe (and wanted) again.
+  static bool wdtArmedLate = false;
+  if (safeMode && !wdtArmedLate) {
+    wdtArmedLate = true;
+    wdtSetup();
+    wdtPet();
+    Serial.println("safe mode: bring-up survived, watchdog armed");
+  }
+
+  // The boot "took". Clear the streak so the next boot starts from zero and
+  // the pod comes back out of safe mode on its own. Deliberately time-based
+  // rather than "reached loop() once": a pod that reboots after 3 s of
+  // runtime is still looping, and must still count as one.
+  static bool bootConfirmed = false;
+  if (!bootConfirmed && millis() >= BOOT_HEALTHY_MS) {
+    bootConfirmed = true;
+    bootCountClear();
+    Serial.println("boot confirmed healthy - reboot streak cleared");
+  }
 
   static uint32_t tRead = 0, tAdv = 0, tDraw = 0, tSer = 0;
   static float    egtC = NAN, cjC = NAN;
@@ -588,14 +820,21 @@ void loop() {
   // (The pairing long-press fires at 1 s on the way to 10 s — harmless,
   // the pod sleeps right after and advertising stops anyway.) The
   // countdown screen below makes the 10 s hold legible from ~2 s in.
+  // Safe mode disables it: System OFF is a reboot path, and a pod that has
+  // been cycling must not be given another way to disappear before the user
+  // has read the screen.
   static uint32_t sleepHoldSince = 0;
   const bool btnDown = digitalRead(BTN_PIN) == LOW;
-  if (!btnDown) {
+  if (!btnDown || safeMode) {
     sleepHoldSince = 0;
   } else if (sleepHoldSince == 0) {
     sleepHoldSince = millis();
   } else if (millis() - sleepHoldSince >= SLEEP_HOLD_MS) {
-    enterDeepSleep();                            // does not return
+    // Returns only when USB bus power blocks System OFF; it has already
+    // waited out the release, so just re-arm the hold.
+    (void)enterDeepSleep();
+    sleepHoldSince = 0;
+    tDraw = 0;
   }
 
   if (millis() - tRead >= READ_MS) {
@@ -611,6 +850,14 @@ void loop() {
     // reconfigure (the chip's "reset"), throttled to one attempt per 2 s.
     // Meanwhile the payload keeps broadcasting the 0x8000 sentinel and the
     // sequence counter keeps advancing — the pod can never zombie again.
+    //
+    // This is also what carries a pod that booted WITHOUT the sensor (see
+    // sensorFailed()): with no address yet, recovery re-runs detection
+    // first, so a sensor that shows up late — or a lead reseated in the
+    // field — is picked up without a reboot. One try per address and no
+    // inter-try gap keeps that pass to a couple of ms, well inside the
+    // advertising tick; the boot path is the one that can afford to be
+    // patient about a mid-conversion NACK.
     static uint8_t  mcpFaultRun = 0;
     static uint32_t tRecover    = 0;
     const bool faulted = isnan(egtC) && isnan(cjC);
@@ -621,9 +868,16 @@ void loop() {
     }
     if (mcpFaultRun >= 5 && millis() - tRecover >= 2000) {
       tRecover = millis();
-      Serial.println("MCP fault run -> bus clear + mode cycle");
       softI2cBusClear(mcpBus);
-      if (mcpModeCycle(mcp)) {
+      if (mcp.addr == 0) {
+        if (mcpDetect(mcp, /*triesPerAddr=*/1, /*gapMs=*/0)) {
+          Serial.print("MCP9600 found at runtime @0x");
+          Serial.println(mcp.addr, HEX);
+        }
+      } else {
+        Serial.println("MCP fault run -> bus clear + mode cycle");
+      }
+      if (mcp.addr != 0 && mcpModeCycle(mcp)) {
         Serial.println("MCP recovered in place");
         mcpFaultRun = 0;
       }

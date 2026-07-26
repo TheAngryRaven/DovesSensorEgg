@@ -71,12 +71,15 @@ is known to dislike. K-type polarity: **red is negative** (US ANSI).
   informational — the logger pairs by MAC or payload magic).
 - **Hold 10 s** — deep sleep (nRF52 System OFF, ~µA: radio silent, MCP9600
   in shutdown, display off — the enclosure has no power switch). A
-  countdown appears on-screen from ~2 s into the hold.
+  countdown appears on-screen from ~2 s into the hold. **Unplug USB
+  first**: the nRF52840 cannot hold System OFF with bus power present, so
+  the pod says `CAN'T SLEEP` and stays awake rather than resetting.
 - **Hold 5 s to wake** — the press wakes the chip, but boot drops straight
   back to sleep unless the button stays held for 5 s. Nothing is drawn
   during the gate, so a pocket bump never lights the screen or drains the
-  battery. (A watchdog reboot skips the gate — after a hang the pod comes
-  back broadcasting on its own.)
+  battery. Every level decision in the gate is debounced. (A watchdog
+  reboot skips the gate — after a hang the pod comes back broadcasting on
+  its own. So does safe mode, below.)
 
 The egg prints its MAC on serial and the OLED at boot — copy it into the
 logger's `SENSOREGG_MAC` define for strict pairing, or leave the logger's
@@ -103,9 +106,25 @@ Layered, most-specific first:
    counter restarting tells the logger's zombie detection the egg is live
    again. A watchdog reboot is reported on serial (`!! WATCHDOG REBOOT`)
    and as `WDT RESET` on the boot scan screen.
-4. **Fatal-boot retry**: a `FATAL` boot failure (probe absent) shows its
-   screen for 30 s, then hard-resets and retries, so a transient boot
-   glitch self-heals in the field.
+4. **Bring-up never reboots**: a missing or unhealthy MCP9600 shows
+   `NO SENSOR` and the pod boots anyway — radio and screen up, EGT on the
+   invalid sentinel, sensor re-detected and reconfigured by the recovery
+   tick above until it answers. Rebooting is the one recovery that cannot
+   fix a failing boot, and the old 30 s `FATAL` hard-reset turned an
+   absent sensor into an endless reboot cycle (and a pod that was
+   near-impossible to re-flash, because the USB CDC port vanished every
+   30 s).
+5. **Boot-loop breaker**: boots are counted in `GPREGRET2`, which survives
+   every warm reset and System OFF and is cleared by a real power cycle. A
+   run that stays up 15 s clears the streak. Three boots without a healthy
+   run in between means something in bring-up is cycling, so the pod comes
+   up in **safe mode**: the watchdog is held off until `loop()` is actually
+   running, boot screens are skipped, deep sleep is disabled, and sensor
+   detection takes its shortest path. Safe mode is deliberately boring —
+   the point is a pod that sits still, holds its USB enumeration and can be
+   re-flashed without the DFU dance. It shows `SAFE` on the debug screen
+   and the boot count plus `RESETREAS` on serial; power-cycle after a good
+   run to clear it.
 
 ## Libraries
 
