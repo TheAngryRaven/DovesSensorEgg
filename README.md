@@ -50,7 +50,7 @@ cast to int16 (UB). The logger treats readings older than 1 s as gone
 
 | Signal | XIAO pin |
 |---|---|
-| OLED SCL (hardware `Wire`, 100 kHz) | D5 |
+| OLED SCL (hardware `Wire`, 400 kHz) | D5 |
 | OLED SDA | D4 |
 | MCP9600 SCL (dedicated soft bus, ~50 kHz) | D3 |
 | MCP9600 SDA | D2 |
@@ -60,16 +60,19 @@ cast to int16 (UB). The logger treats readings older than 1 s as gone
 > events with **no timeout** (`while (!_p_twim->EVENTS_STOPPED);` has no
 > error escape at all), so a transfer that goes wrong badly enough never
 > returns, and the watchdog turns that into an exact ~9 s reboot cycle
-> (8 s WDT + boot overhead) — the 2026-07-26 boot loop, field-confirmed
-> twice, the second time with the bus already back at 100 kHz. The sketch
-> therefore never enters `Wire` blind: the OLED must first ACK a real
-> addressed probe on a temporary, timeout-capable **soft bus** over the
-> same pins, and if a boot dies inside display bring-up anyway, the next
-> boot skips the display outright (the **display deadman**, below).
-> `OLED_I2C_HZ` (100 kHz) must be given to the *display driver* as well as
-> to `Wire` — Adafruit_SSD1306 and SH110X default to 400 kHz and re-assert
-> it around every transfer, so a display constructed without those
-> arguments ignores `Wire.setClock()`.
+> (8 s WDT + boot overhead) — the 2026-07-26 boot loop. Root cause, found
+> three rounds in: a **mis-soldered power harness** (GND on 3V3, VCC on an
+> IO pin) wedging the first TWIM transfer of every boot. Not firmware —
+> but it proved the class is real, so the guards stay: the sketch never
+> enters `Wire` blind (the OLED must first ACK a real addressed probe on a
+> temporary, timeout-capable **soft bus** over the same pins), and if a
+> boot dies inside display bring-up anyway, the next boot skips the
+> display outright (the **display deadman**, below). `OLED_I2C_HZ`
+> (400 kHz — the panel's rated speed, viable because the breakout has its
+> own pullups) must be given to the *display driver* as well as to `Wire`
+> — Adafruit_SSD1306 and SH110X re-assert their constructor speed around
+> every transfer, so a display constructed without those arguments ignores
+> `Wire.setClock()`.
 
 ### Wiring truth table (XIAO, USB connector up)
 

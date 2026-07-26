@@ -28,9 +28,9 @@
    a probe on a TEMPORARY timeout-capable soft bus before hardware Wire
    is entered at all; if the previous run died inside display bring-up
    (noinit scratch - the display deadman), the display is skipped for a
-   boot; and safe mode never brings it up. The bus runs at 100 kHz
+   boot; and safe mode never brings it up. The bus runs at 400 kHz
    (OLED_I2C_HZ), passed to the DISPLAY DRIVER too - Adafruit_SSD1306 /
-   SH110X default to 400 kHz and re-assert it around every transfer.
+   SH110X re-assert their constructor speed around every transfer.
 
    NOTHING IN BRING-UP REBOOTS THE POD (2026-07-26). A missing or
    unhealthy MCP9600 boots degraded - radio and screen up, readings on
@@ -70,18 +70,27 @@
 #define OLED_W     128
 #define OLED_H      64
 
-// OLED bus speed. 100 kHz, and passed to the display driver as well as to
-// Wire — see the boot-loop note below. Do not raise this without fitting
-// real pullups first: TwoWire::begin() on this core configures the nRF52's
-// INTERNAL ~13 k pullups, and 13 k against a few tens of pF of flying lead
-// gives a rise time near 1 us. That fits inside 100 kHz's 1000 ns budget
-// and blows straight through 400 kHz's 300 ns.
+// OLED bus speed: 400 kHz, the panel's rated fast-mode and what this pod
+// ran from day one (see below). A full 128x64 frame is ~1 KB; at 400 kHz
+// a redraw is ~25 ms of blocking I2C, at 100 kHz it is ~90 ms — at the
+// 5 Hz draw tick that difference is nearly half the loop's time budget.
+// The OLED breakout carries its own pullups, which is what makes 400 kHz
+// legitimate; the nRF52's internal ~13 k pullups alone would be marginal.
 //
-// Both numbers matter, and the second one is easy to miss: Adafruit_SSD1306
-// (and SH110X) default to clkDuring=400000 and re-assert it with
-// wire->setClock() around EVERY transfer, so a display constructed without
-// these arguments runs at 400 kHz no matter what the sketch asked Wire for.
-#define OLED_I2C_HZ  100000UL
+// History: this was dropped to 100 kHz while chasing the 2026-07-26 boot
+// loop, on a rise-time theory that turned out to be WRONG — the loop's
+// root cause was a mis-soldered power harness (GND on 3V3, VCC on an IO
+// pin), which wedged the first TWIM transfer of every boot. With the
+// harness fixed, 400 kHz is back. If a wedge ever reappears, the guards
+// hold: the soft probe refuses a dead bus before Wire is entered, and
+// the display deadman skips the display one boot after any death inside
+// its bring-up.
+//
+// The speed must ALSO be handed to the display driver — Adafruit_SSD1306
+// and SH110X default to clkDuring=400000 and re-assert it with
+// wire->setClock() around EVERY transfer, so the constructor args below,
+// not Wire.setClock(), are what actually governs the panel's transfers.
+#define OLED_I2C_HZ  400000UL
 // ---------------------------------------------------------------------------
 
 #if USE_SH1106
@@ -131,8 +140,11 @@
 
 // ---- boot-loop breaker ----------------------------------------------------
 // Boot-loop incident (2026-07-26): the pod rebooted forever after a flash
-// and only DFU mode could stop it. Three separate reboot paths had been
-// added with nothing to break the cycle they formed:
+// and only DFU mode could stop it. Root cause, found three rounds in: a
+// mis-soldered power harness (GND on 3V3, VCC on an IO) wedging the
+// no-timeout hardware Wire — see the OLED probe note. But the hunt also
+// exposed three real latent reboot paths that had been added with nothing
+// to break the cycle they could form:
 //   * fatal() hard-reset every 30 s, so an MCP9600 that missed its boot
 //     handshake rebooted the pod for as long as it stayed missing;
 //   * wakeHoldGate() sampled the button ONCE, undebounced, so a bouncing
@@ -511,10 +523,12 @@ void wakeHoldGate() {
 // endTransmission() never returns. There is no recovery from inside the
 // app: the watchdog fires 8 s later, boot runs into the same transfer, and
 // the pod cycles on an exact ~9 s period (8 s WDT + boot overhead) until
-// someone holds it in DFU. Field-confirmed twice on 2026-07-26 — the
-// second time with the sketch's own Wire clock already back at 100 kHz, so
-// bus speed alone was NOT the trigger; something about the first hardware
-// TWIM transaction on this bus wedges it.
+// someone holds it in DFU. Field-confirmed twice on 2026-07-26. ROOT
+// CAUSE (found third round): a mis-soldered power harness — GND on the
+// 3V3 pin, VCC on an IO — which wedged the first TWIM transfer of every
+// boot. Not a firmware bug, but it proved the CLASS is real: any
+// electrical fault on this bus turns the no-timeout Wire into an
+// unrecoverable boot loop, which is why these guards stay after the fix.
 //
 // So the probing moved OFF the hardware Wire entirely. The OLED is probed
 // on a TEMPORARY timeout-capable soft bus over the same two pins: bus
