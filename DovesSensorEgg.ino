@@ -788,13 +788,15 @@ void setup() {
   softI2cBusClear(mcpBus);
   mcp.bus = &mcpBus;
 
-  // Safe mode does one quick pass instead of three retried ones: bring-up
-  // is what keeps failing, so it gets the shortest path to loop(), where
-  // the recovery tick retries the sensor anyway.
-  const int detectAttempts = safeMode ? 1 : 3;
+  // Full retried scan, safe mode included. Safe mode trims things that can
+  // HANG or that cost seconds; this costs ~0.5 s and buys the one rule the
+  // driver is built on — the chip NACKs its own address mid-conversion, so
+  // a single NACK never means absent. Thinning it here would make the pod
+  // most likely to report "no sensor" exactly when someone is standing over
+  // it trying to work out what is wrong.
   bool mcpOK = false;
-  for (int attempt = 1; attempt <= detectAttempts && !mcpOK; attempt++) {
-    mcpOK = mcpDetect(mcp, /*triesPerAddr=*/safeMode ? 1 : 3, /*gapMs=*/20);
+  for (int attempt = 1; attempt <= 3 && !mcpOK; attempt++) {
+    mcpOK = mcpDetect(mcp, /*triesPerAddr=*/3, /*gapMs=*/20);
     if (!mcpOK) {
       Serial.print("MCP detect attempt "); Serial.print(attempt);
       Serial.println(" failed (soft bus D2/D3)");
