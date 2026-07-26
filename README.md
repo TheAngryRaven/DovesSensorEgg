@@ -71,6 +71,44 @@ cast to int16 (UB). The logger treats readings older than 1 s as gone
 > it around every transfer, so a display constructed without those
 > arguments ignores `Wire.setClock()`.
 
+### Wiring truth table (XIAO, USB connector up)
+
+```
+left column, top to bottom          right column, top to bottom
+  D0                                  5V
+  D1  <- button (to GND)              GND
+  D2  <- MCP9600 SDA                  3V3  <- both modules' VCC
+  D3  <- MCP9600 SCL                  D10
+  D4  <- OLED SDA  (chip SDA pin)     D9
+  D5  <- OLED SCL  (chip SCL pin)     D8
+  D6                                  D7
+```
+
+Both breakout modules also need **3V3 and GND**. Two buses going silent
+at the same time is almost always the shared power feed, not the data
+pins — the harness diagnostic below will say which.
+
+### Harness diagnostic
+
+If either device is missing at boot, the pod diagnoses its own wiring on
+the bounded soft bus (never the hardware `Wire`):
+
+- **Per-line electrical state** for each bus pin: `STUCK LOW` (short, or
+  an unpowered device clamping the line), `no external pullup` (module
+  absent or **unpowered** — every breakout in this build carries its own
+  pullups, so their absence means the module isn't there electrically),
+  or `ok`.
+- **Full-address scan (0x08–0x77) over every pin pairing of D2–D5** —
+  canonical and swapped, both buses — with an MCP9600 ID handshake and
+  OLED recognition. A module wired with SDA/SCL swapped, or plugged into
+  the other bus, is *found and named*. The MCP9600 is **adopted wherever
+  it answers** (its bus is soft — the pins are just numbers) and the log
+  tells you the canonical rewire; an OLED found off `SDA→D4 SCL→D5`
+  can't be adopted (the TWIM's pins are fixed) so the log names the
+  exact wires to swap. While no sensor is adopted, `loop()`'s recovery
+  tick repeats a quiet version of the sweep every 2 s — plugging the
+  sensor in late just works.
+
 The MCP9600's bus is bit-banged with a per-transaction timeout and runs
 deliberately slow for EMI margin — the chip clock-stretches aggressively
 and its probe lead is an antenna. 4.7 kΩ pullups to 3V3 recommended on

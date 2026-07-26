@@ -251,6 +251,7 @@ uint32_t nRead    = 0;
 bool     safeMode  = false;   // boot-loop breaker tripped (see BOOT_* above)
 uint8_t  bootCount = 0;       // consecutive boots without a healthy run
 bool     displayDeadman = false;  // previous run died IN display bring-up
+bool     wireBegun = false;   // hardware Wire owns D4/D5 - no soft probing them
 
 uint16_t advSeq    = 0;
 uint32_t pairUntil = 0;       // millis deadline; 0 = pairing window closed
@@ -545,6 +546,194 @@ uint8_t oledSoftProbe() {
   }
   // Pins are left released (INPUT_PULLUP) for Wire to take over.
   return found;
+}
+
+// -------------------------------------------------- harness diagnostic
+// Field report (2026-07-26, after the loop was broken): BOTH I2C devices
+// silent at once — no OLED ACK on D4/D5, no MCP9600 on D2/D3. Two
+// devices on two separate buses do not fail simultaneously by
+// coincidence; that is a statement about the HARNESS (module power, a
+// shared rail, or SDA/SCL orientation), and the pod can pin it down
+// itself instead of asking for a multimeter. Everything here runs on the
+// bounded soft bus — the hardware Wire is never touched.
+//
+// Two tools:
+//  * lineReport(): per-pin electrical state. With the internal pullup a
+//    healthy idle line reads HIGH — LOW means clamped (short, or an
+//    unpowered device's protection diode). Then discharge the line and
+//    FLOAT it: only an EXTERNAL pullup can bring it back up, and every
+//    breakout in this build carries its own pullups — so "no external
+//    pullup" on both pins of a bus means the module is absent or, far
+//    more likely after a rewire, not powered.
+//  * a full-address scan (0x08-0x77) over every pin pairing of the four
+//    bus pins — canonical and swapped, both buses — with an MCP9600 ID
+//    handshake at 0x60-0x67 hits and OLED recognition at 0x3C/0x3D. A
+//    module wired with SDA/SCL swapped or plugged into the other bus is
+//    FOUND and named. (Blind probes of the MCP range are normally
+//    avoided — see mcp9600.h — but this only runs when the chip is
+//    already unreachable, and a found chip is immediately mode-cycled.)
+//
+// The MCP9600 is adopted wherever it answers: its bus is soft, so the
+// pins are just numbers. The OLED can only be REPORTED if found off its
+// canonical orientation — the TWIM's pins are fixed by the variant — so
+// the pod prints exactly which wires to swap instead.
+
+struct BusCfg { uint8_t sda; uint8_t scl; };
+static const BusCfg kBusCfgs[] = {
+  {MCP_SDA_PIN, MCP_SCL_PIN},   // canonical sensor bus
+  {MCP_SCL_PIN, MCP_SDA_PIN},   // D2/D3 swapped
+  {SDA, SCL},                   // canonical display bus (D4/D5)
+  {SCL, SDA},                   // D4/D5 swapped
+};
+
+static void printPinName(uint8_t pin) {
+  Serial.print('D'); Serial.print(pin);  // Dn == n on this variant
+}
+
+static bool cfgUsesDisplayPins(uint8_t sdaPin) {
+  return sdaPin == SDA || sdaPin == SCL;   // (scl is then the other one)
+}
+
+static void lineReport(uint8_t pin) {
+  pinMode(pin, INPUT_PULLUP);
+  delayMicroseconds(300);
+  const bool highWithPull = digitalRead(pin) == HIGH;
+  // Discharge, then float with NO pull: only an external pullup can
+  // bring the line back up within the settle window.
+  digitalWrite(pin, LOW);
+  pinMode(pin, OUTPUT);
+  delayMicroseconds(50);
+  pinMode(pin, INPUT);
+  delayMicroseconds(300);
+  const bool extPullup = digitalRead(pin) == HIGH;
+  pinMode(pin, INPUT_PULLUP);
+
+  Serial.print("  line "); printPinName(pin); Serial.print(": ");
+  if (!highWithPull) {
+    Serial.println("STUCK LOW - short, or clamped by an unpowered device");
+  } else if (extPullup) {
+    Serial.println("ok - external pullup present (module powered)");
+  } else {
+    Serial.println("no external pullup - module absent or UNPOWERED?");
+  }
+}
+
+// Scan one pin pairing. Prints what ACKed; fills in a validated MCP9600
+// address and/or an OLED address if seen. Returns total ACK count.
+static uint8_t scanCfg(uint8_t sdaPin, uint8_t sclPin,
+                       uint8_t& mcpAt, uint8_t& oledAt) {
+  SoftI2C bus = {sdaPin, sclPin, /*halfPeriodUs=*/5, /*stretchTimeoutUs=*/2000};
+  softI2cBegin(bus);
+  softI2cBusClear(bus);
+  mcpAt = 0;
+  oledAt = 0;
+  uint8_t nAck = 0;
+  Serial.print("  scan SDA="); printPinName(sdaPin);
+  Serial.print(" SCL=");       printPinName(sclPin);
+  Serial.print(":");
+  for (uint8_t a = 0x08; a <= 0x77; a++) {
+    if (softI2cWriteRead(bus, a, nullptr, 0, nullptr, 0) !=
+        SoftI2CStatus::kOk) {
+      continue;
+    }
+    nAck++;
+    if (nAck <= 8) { Serial.print(" 0x"); Serial.print(a, HEX); }
+    if (a >= mcp9600_regs::kAddrFirst && a <= mcp9600_regs::kAddrLast) {
+      Mcp9600 probeChip;
+      probeChip.bus = &bus;
+      uint8_t hi = 0, lo = 0;
+      if (mcpIdHandshake(probeChip, a, hi, lo) &&
+          mcp9600_regs::isValidDeviceId(hi)) {
+        mcpAt = a;
+      }
+    } else if (a == 0x3C || a == 0x3D) {
+      oledAt = a;
+    }
+  }
+  if (nAck == 0) Serial.print(" no ACKs (0x08-0x77)");
+  Serial.println();
+  return nAck;
+}
+
+// Full harness sweep. Returns true if the MCP9600 was found and adopted
+// (mcp.addr + mcpBus pins are then live; caller still mode-cycles it).
+static bool harnessDiag() {
+  Serial.println("[boot] harness diagnostic - I2C device(s) missing");
+  lineReport(MCP_SDA_PIN);
+  lineReport(MCP_SCL_PIN);
+  if (!wireBegun) {
+    lineReport(SDA);
+    lineReport(SCL);
+  }
+
+  bool mcpAdopted = false;
+  uint16_t totalAcks = 0;
+  for (const BusCfg& cfg : kBusCfgs) {
+    if (wireBegun && cfgUsesDisplayPins(cfg.sda)) continue;  // TWIM owns D4/D5
+    uint8_t mcpAt = 0, oledAt = 0;
+    totalAcks += scanCfg(cfg.sda, cfg.scl, mcpAt, oledAt);
+
+    if (mcpAt && !mcpAdopted) {
+      mcpBus.sdaPin = cfg.sda;
+      mcpBus.sclPin = cfg.scl;
+      softI2cBegin(mcpBus);
+      softI2cBusClear(mcpBus);
+      mcp.addr = mcpAt;
+      mcpAdopted = true;
+      Serial.print("  -> MCP9600 found at 0x"); Serial.print(mcpAt, HEX);
+      Serial.print(", ADOPTING SDA="); printPinName(cfg.sda);
+      Serial.print(" SCL=");           printPinName(cfg.scl);
+      Serial.println();
+      if (cfg.sda != MCP_SDA_PIN || cfg.scl != MCP_SCL_PIN) {
+        Serial.println("     (non-canonical - rewire to SDA->D2 SCL->D3 when convenient)");
+      }
+    }
+    if (oledAt) {
+      Serial.print("  -> OLED found at 0x"); Serial.print(oledAt, HEX);
+      Serial.print(" with SDA="); printPinName(cfg.sda);
+      Serial.print(" SCL=");      printPinName(cfg.scl);
+      Serial.println();
+      if (cfg.sda != SDA || cfg.scl != SCL) {
+        Serial.println("     the display bus is HARDWARE and cannot follow: rewire the");
+        Serial.println("     OLED to SDA->D4 SCL->D5 to get the screen back");
+      }
+    }
+  }
+
+  if (totalAcks == 0) {
+    Serial.println("  VERDICT: nothing ACKed on any pairing of D2-D5. Two dead");
+    Serial.println("  buses at once is almost always module POWER - check 3V3 and");
+    Serial.println("  GND to both breakouts first, then data wiring. Expected:");
+    Serial.println("    MCP9600: SDA->D2  SCL->D3   |   OLED: SDA->D4  SCL->D5");
+    Serial.println("    (XIAO left column, USB up: D0 D1 D2 D3 D4 D5 D6 top->bottom)");
+  }
+  Serial.flush();
+  return mcpAdopted;
+}
+
+// Runtime flavor: quiet single-try sweep, used by loop()'s recovery tick
+// while no sensor is adopted. A found chip prints; misses stay silent.
+static bool mcpRuntimeLocate() {
+  for (const BusCfg& cfg : kBusCfgs) {
+    if (wireBegun && cfgUsesDisplayPins(cfg.sda)) continue;
+    mcpBus.sdaPin = cfg.sda;
+    mcpBus.sclPin = cfg.scl;
+    softI2cBegin(mcpBus);
+    softI2cBusClear(mcpBus);
+    if (mcpDetect(mcp, /*triesPerAddr=*/1, /*gapMs=*/0)) {
+      if (cfg.sda != MCP_SDA_PIN || cfg.scl != MCP_SCL_PIN) {
+        Serial.print("MCP9600 answering on SDA=");
+        printPinName(cfg.sda);
+        Serial.print(" SCL=");
+        printPinName(cfg.scl);
+        Serial.println(" - wires not on D2(SDA)/D3(SCL); adopted anyway");
+      }
+      return true;
+    }
+  }
+  mcpBus.sdaPin = MCP_SDA_PIN;   // canonical again for the next attempt
+  mcpBus.sclPin = MCP_SCL_PIN;
+  return false;
 }
 
 // -------------------------------------------------- debounced button
@@ -851,6 +1040,7 @@ void setup() {
       Serial.print("  OLED ACKs at 0x"); Serial.println(oledAddr, HEX);
       Serial.println("  entering hardware Wire (the no-way-back call)...");
       Serial.flush();   // if boot dies here, the log must already say where
+      wireBegun = true;
       Wire.begin();
       Wire.setClock(OLED_I2C_HZ);
       delay(50);
@@ -886,6 +1076,21 @@ void setup() {
       Serial.println(" failed (soft bus D2/D3)");
       softI2cBusClear(mcpBus);
       bootDelay(200);
+    }
+    wdtPet();
+  }
+
+  // Anything missing -> full harness diagnostic: per-line electrical
+  // state, then a scan of every pin pairing of D2-D5 for both devices.
+  // Both buses silent at once is a harness statement (power, rail,
+  // SDA/SCL orientation), not two coincidences — make the pod say which.
+  // The sweep ADOPTS an MCP9600 found on non-canonical pins (its bus is
+  // soft; the pins are just numbers) and names the exact rewire for an
+  // OLED found off D4(SDA)/D5(SCL) — the TWIM's pins can't follow.
+  if (!oledOK || !mcpOK) {
+    if (harnessDiag() && !mcpOK) {
+      Serial.println("  (sensor adopted by the diagnostic - continuing)");
+      mcpOK = true;
     }
     wdtPet();
   }
@@ -1037,7 +1242,10 @@ void loop() {
       tRecover = millis();
       softI2cBusClear(mcpBus);
       if (mcp.addr == 0) {
-        if (mcpDetect(mcp, /*triesPerAddr=*/1, /*gapMs=*/0)) {
+        // Not adopted yet: sweep every pin pairing (quiet), so a sensor
+        // wired to the wrong pins — or plugged in after boot — is picked
+        // up in place. ~30 ms once per 2 s; the loop never notices.
+        if (mcpRuntimeLocate()) {
           Serial.print("MCP9600 found at runtime @0x");
           Serial.println(mcp.addr, HEX);
         }
