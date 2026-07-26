@@ -105,11 +105,28 @@ left column, top to bottom          right column, top to bottom
 
 **Thermistor divider** (aux temperature, payload bytes 14–15): 100k NTC
 from **D6** to the sense node, 100k fixed from the sense node to **A0/D0
-and GND**. D6 is driven high only for the ~4 ms around each 1 Hz read —
-no idle drain, no self-heating, nothing left energized in deep sleep.
-The read is ratiometric (`AR_VDD4` reference = the same rail D6 drives),
-so no calibration constant exists; tune `THERM_R0/B/R_FIXED` in
-`thermistor.h` if the part deviates from 100k/3950.
+and GND**, and a **10 nF ceramic smoothing cap from the sense node to
+GND** — placed at the XIAO end of the leads, not out at the thermistor,
+with the NTC run as a twisted pair (the leads live near ignition wiring
+and are antennas, same as the TC lead). The cap is load-bearing twice
+over: it low-passes ignition spikes (~320 Hz cutoff at mid-scale), and
+it is what makes the ADC timing legitimate — this core's SAADC uses a
+fixed 3 µs acquisition, rated for ≤10 kΩ source impedance, while the
+divider's Thevenin impedance reaches ~100 kΩ with a cold NTC; the cap is
+a local charge reservoir ~4000× the SAADC's sample cap. Optional extra:
+~1 kΩ in series from the node into A0 for RF/pin protection (no ratio
+error — at DC the ADC draws from the cap, not through the resistor).
+
+D6 is driven high only for the ~13 ms around each 1 Hz read — no idle
+drain, no self-heating, nothing left energized in deep sleep. **The cap
+value and `THERM_SETTLE_MS` are coupled**: the node charges through the
+divider each pulse (worst-case τ = 100 kΩ × C, cold NTC), and the settle
+must be ≥ ~10 τ or cold readings come out low. The define in the sketch
+carries the table (10 nF → 12 ms, 100 nF → 75 ms, …) — change the cap,
+change the number. The read is ratiometric (`AR_VDD4` reference = the
+same rail D6 drives), so no calibration constant exists; tune
+`THERM_R0/B/R_FIXED` in `thermistor.h` if the part deviates from
+100k/3950.
 
 **Battery** (payload byte 11): the XIAO's onboard 1M/510k divider on
 `PIN_VBAT`, gated by `VBAT_ENABLE` and pulsed the same way (every 30 s).

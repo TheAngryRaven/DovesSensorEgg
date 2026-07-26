@@ -127,6 +127,16 @@
 // microscopic against GPIO drive).
 #define THERM_PWR_PIN D6
 #define THERM_ADC_PIN A0
+// Power-gate settle before sampling. Sized for the SMOOTHING CAP on the
+// sense node (10 nF default — fit it: the leads run near ignition
+// wiring, and it also makes the SAADC's 3 us acquisition legitimate at
+// this source impedance, see readThermistorC). The node charges through
+// the divider each pulse, worst case tau = R_FIXED x C at cold-NTC
+// (Thevenin -> 100k); settle >= ~10 tau or cold readings come out low:
+//   no cap -> 3 ms | 10 nF -> 12 | 22 nF -> 25 | 47 nF -> 50 | 100 nF -> 75
+// (75 ms stalls one loop tick per second — benign, the SoftDevice keeps
+// advertising autonomously between payload rebuilds.)
+#define THERM_SETTLE_MS 12
 #define READ_MS    100        // MCP @16-bit converts in ~63-80ms
 #define THERM_MS  1000        // aux thermistor tick (gated ~4 ms pulse)
 #define BATT_MS  30000        // battery tick (divider pulsed, not left on)
@@ -784,14 +794,27 @@ static bool mcpRuntimeLocate() {
 // Thermistor: ratiometric on purpose. D6 drives the divider at VDD and
 // AR_VDD4 makes VDD the ADC's full scale, so the supply voltage cancels
 // out of the ratio exactly — no calibration constant, no VDD-tolerance
-// error. The ~3 ms settle swamps the RC of the sense node (100k || 100k
-// into a few tens of pF is microseconds); the first sample after a
-// reference switch is discarded per SAADC habit, then 4 are averaged.
-// Total ~4 ms blocking once per THERM_MS — noise against the 100 ms
-// loop tick, not worth a state machine.
+// error. THERM_SETTLE_MS lets the sense node charge through the divider
+// into its smoothing cap (the two are coupled — see the define). The
+// cap is also what makes the ADC timing legitimate: this core's SAADC
+// acquisition is a fixed 3 us, rated by Nordic for <= 10k source
+// impedance, and the divider's Thevenin runs to ~100k cold — but a
+// >= 10 nF reservoir is ~4000x the SAADC sample cap, so each sample
+// draws locally with ~0.03% droop. First sample after the reference
+// switch is discarded per SAADC habit, then 4 are averaged. Total
+// ~13 ms blocking once per THERM_MS — fine against the 100 ms loop
+// tick, not worth a state machine.
+//
+// TACQ trap: analogSampleTime() is GLOBAL core state, like
+// analogReference. Do not "fix" the battery divider's out-of-spec
+// source impedance (1M||510k ~ 338k at 3 us) by raising it — the
+// datalogger's x3.024 battery calibration was measured WITH that
+// acquisition droop baked in (very likely part of its observed 4.11 V
+// at a true 4.20 V). Thermistor gets the cap + default TACQ; battery
+// gets untouched TACQ + the verbatim calibration. They move together.
 float readThermistorC() {
   digitalWrite(THERM_PWR_PIN, HIGH);
-  delay(3);
+  delay(THERM_SETTLE_MS);
   analogReference(AR_VDD4);
   (void)analogRead(THERM_ADC_PIN);           // discard: reference settle
   uint32_t sum = 0;

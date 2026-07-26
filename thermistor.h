@@ -17,6 +17,10 @@
 //   - Counts pegged at either rail mean an open or shorted divider
 //     (thermistor unplugged, wiring fault): NAN, which the payload
 //     encoder turns into the 0x8000 wire sentinel.
+//   - A smoothing cap (10 nF default) sits on the sense node at the
+//     board end — invisible to this math, but the sketch's
+//     THERM_SETTLE_MS must cover its charge time (they are coupled;
+//     see the define in the sketch).
 //
 // Temperature model: the B-parameter equation,
 //   T = 1 / (1/T0 + ln(R/R0)/B) - 273.15
