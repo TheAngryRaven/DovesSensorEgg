@@ -22,6 +22,15 @@
    Deep sleep needs USB UNPLUGGED: the nRF52840 cannot hold System OFF
    with bus power present, it just resets.
 
+   THE OLED BUS RUNS AT 100 kHz (OLED_I2C_HZ) and that number is load
+   bearing, not a preference. This core's Wire spins on TWIM events with
+   no timeout - see wireLinesIdleHigh() - so a transfer that goes wrong
+   badly enough never returns, and the watchdog turns that into an exact
+   8 s reboot cycle. Raising the bus to 400 kHz on the nRF52's internal
+   ~13 k pullups is what caused the 2026-07-26 boot loop. Note the speed
+   must be given to the DISPLAY DRIVER too: Adafruit_SSD1306/SH110X
+   default to 400 kHz and re-assert it around every transfer.
+
    NOTHING IN BRING-UP REBOOTS THE POD (2026-07-26). A missing or
    unhealthy MCP9600 boots degraded - radio and screen up, readings on
    the wire's invalid sentinel, sensor retried by loop()'s recovery tick
@@ -59,18 +68,31 @@
 #define USE_SH1106   0        // 1 = SH1106 (1.3")    0 = SSD1306 (0.96")
 #define OLED_W     128
 #define OLED_H      64
+
+// OLED bus speed. 100 kHz, and passed to the display driver as well as to
+// Wire — see the boot-loop note below. Do not raise this without fitting
+// real pullups first: TwoWire::begin() on this core configures the nRF52's
+// INTERNAL ~13 k pullups, and 13 k against a few tens of pF of flying lead
+// gives a rise time near 1 us. That fits inside 100 kHz's 1000 ns budget
+// and blows straight through 400 kHz's 300 ns.
+//
+// Both numbers matter, and the second one is easy to miss: Adafruit_SSD1306
+// (and SH110X) default to clkDuring=400000 and re-assert it with
+// wire->setClock() around EVERY transfer, so a display constructed without
+// these arguments runs at 400 kHz no matter what the sketch asked Wire for.
+#define OLED_I2C_HZ  100000UL
 // ---------------------------------------------------------------------------
 
 #if USE_SH1106
   #include <Adafruit_SH110X.h>
-  Adafruit_SH1106G oled(OLED_W, OLED_H, &Wire, -1);
+  Adafruit_SH1106G oled(OLED_W, OLED_H, &Wire, -1, OLED_I2C_HZ, OLED_I2C_HZ);
   #define PX_ON   SH110X_WHITE
   #define PX_OFF  SH110X_BLACK
   #define DRV_NAME "SH1106"
   #define DISPLAY_OFF() oled.oled_command(SH110X_DISPLAYOFF)
 #else
   #include <Adafruit_SSD1306.h>
-  Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, -1);
+  Adafruit_SSD1306 oled(OLED_W, OLED_H, &Wire, -1, OLED_I2C_HZ, OLED_I2C_HZ);
   #define PX_ON   SSD1306_WHITE
   #define PX_OFF  SSD1306_BLACK
   #define DRV_NAME "SSD1306"
@@ -208,6 +230,17 @@ void bootDelay(uint32_t ms) {
     delay(10);
   }
   wdtPet();
+}
+
+// Name each stage of bring-up on the way IN, flushed immediately. When the
+// pod hangs, the last line on the wire is the step that hung — the 2026-07-26
+// loop had to be pinned down by measuring the reboot period against
+// WDT_TIMEOUT_S and reading the core's Wire source, because boot printed
+// nothing between the banner and a step three calls later. Serial.flush()
+// matters: without it the tail of the CDC FIFO dies with the hang.
+void bootStep(const char* what) {
+  Serial.print("[boot] "); Serial.println(what);
+  Serial.flush();
 }
 
 // Read + clear the sticky reset-reason register. Callers test the bits:
@@ -408,6 +441,36 @@ void i2cBusClear() {
   digitalWrite(SDA, HIGH); delayMicroseconds(10);
   pinMode(SDA, INPUT_PULLUP);
   pinMode(SCL, INPUT_PULLUP);
+}
+
+// -------------------------------------------------- hardware Wire safety
+// THE HARDWARE Wire ON THIS CORE CAN HANG FOREVER, AND THAT HANG IS A BOOT
+// LOOP. Wire_nRF52.cpp spins on raw TWIM events with no timeout:
+//
+//     while(!_p_twim->EVENTS_TXSTARTED && !_p_twim->EVENTS_ERROR);
+//     while(!_p_twim->EVENTS_LASTTX    && !_p_twim->EVENTS_ERROR);
+//     while(!_p_twim->EVENTS_STOPPED);          <- no error escape at all
+//
+// If a transfer goes wrong badly enough that the TWIM never raises STOPPED,
+// endTransmission() never returns. There is no recovery from inside the
+// app: the watchdog fires 8 s later, boot runs into the same transfer, and
+// the pod cycles on an exact 8 s period until someone holds it in DFU. That
+// is the 2026-07-26 boot loop, and raising this bus to 400 kHz on internal
+// pullups is what walked us into it — scanBus() is the FIRST Wire transfer
+// of the boot and the only one the sketch's own setClock() governs (the
+// display driver overrides the clock for its own transfers, see
+// OLED_I2C_HZ), so it took the change head-on.
+//
+// So bring-up never enters a Wire call blind. Both lines must read released
+// and high, with the pullups on and the TWIM out of the way, before the
+// peripheral is allowed to touch them; if they do not, the display is
+// dropped and the pod boots without it. A pod that broadcasts with no
+// screen is worth infinitely more than one that loops.
+bool wireLinesIdleHigh() {
+  pinMode(SDA, INPUT_PULLUP);
+  pinMode(SCL, INPUT_PULLUP);
+  delayMicroseconds(200);          // pullup + line capacitance settle
+  return digitalRead(SDA) == HIGH && digitalRead(SCL) == HIGH;
 }
 
 // -------------------------------------------------- OLED probe (Wire)
@@ -671,34 +734,56 @@ void setup() {
   }
   if (safeMode) {
     Serial.println("!! SAFE MODE - repeated reboots without a healthy run.");
-    Serial.println("   Watchdog held off, boot screens skipped, sleep disabled.");
+    Serial.println("   Watchdog held off until loop() runs; display NOT brought");
+    Serial.println("   up (the hardware Wire is the one call that can hang with");
+    Serial.println("   no way back); boot screens and deep sleep disabled.");
     Serial.println("   Power-cycle after a good run to clear.");
   }
 
-  i2cBusClear();               // recover a slave wedged by a mid-read reset
-  Wire.begin();
-  // 400 kHz: the OLED is alone on this bus now. (It was pinned to 100 kHz
-  // only because the clock-stretching MCP9600 shared it — that constraint
-  // moved to the dedicated soft bus along with the chip.)
-  Wire.setClock(400000);
-  delay(100);
-  scanBus();
-
-  if (oledAddr) {
-  #if USE_SH1106
-    oledOK = oled.begin(oledAddr, true);
-  #else
-    oledOK = oled.begin(SSD1306_SWITCHCAPVCC, oledAddr);
-  #endif
-    Serial.print("OLED "); Serial.print(DRV_NAME);
-    Serial.println(oledOK ? " init ok" : " init FAILED");
+  // ---- display bring-up, the one part of boot that can hang unrecoverably.
+  // Safe mode skips it outright: the hardware Wire is the only call in this
+  // sketch with no way back, so a pod that has been cycling gets brought up
+  // without it. Serial and BLE do not need the display, and a pod on the air
+  // with a dark screen can at least be diagnosed and re-flashed.
+  bootStep("display bring-up");
+  if (safeMode) {
+    Serial.println("  safe mode - display skipped (hardware Wire not entered)");
   } else {
-    Serial.println("no OLED on bus - serial only");
+    i2cBusClear();             // recover a slave wedged by a mid-read reset
+    bool linesOK = wireLinesIdleHigh();
+    if (!linesOK) {
+      Serial.println("  OLED bus not idle-high - re-running bus clear");
+      i2cBusClear();
+      linesOK = wireLinesIdleHigh();
+    }
+    if (!linesOK) {
+      // Entering the TWIM now is the hang. Refuse, and boot without it.
+      Serial.println("  !! OLED bus STILL held low (SDA/SCL) - skipping display.");
+      Serial.println("     Check D4/D5 wiring and pullups; serial + BLE only.");
+    } else {
+      Wire.begin();
+      Wire.setClock(OLED_I2C_HZ);
+      delay(100);
+      scanBus();
+
+      if (oledAddr) {
+      #if USE_SH1106
+        oledOK = oled.begin(oledAddr, true);
+      #else
+        oledOK = oled.begin(SSD1306_SWITCHCAPVCC, oledAddr);
+      #endif
+        Serial.print("  OLED "); Serial.print(DRV_NAME);
+        Serial.println(oledOK ? " init ok" : " init FAILED");
+      } else {
+        Serial.println("  no OLED on bus - serial only");
+      }
+    }
   }
 
   // MCP9600 on its own timeout-capable soft bus: proper ID handshake at
   // each candidate address (retried — a mid-conversion NACK is normal and
   // must never read as "absent"), never a blind probe.
+  bootStep("MCP9600 detect (soft bus D2/D3)");
   softI2cBegin(mcpBus);
   softI2cBusClear(mcpBus);
   mcp.bus = &mcpBus;
@@ -739,22 +824,15 @@ void setup() {
     if (wdtReboot) { oled.setCursor(0, 54); oled.print("WDT RESET"); }
     oled.display();
     bootDelay(2000);
-  } else if (oledOK) {
-    oled.clearDisplay();
-    oled.setTextSize(1); oled.setTextColor(PX_ON, PX_OFF);
-    oled.setCursor(0, 0);  oled.print("SAFE MODE");
-    oled.setCursor(0, 18); oled.print("boot #"); oled.print(bootCount);
-    oled.setCursor(0, 32); oled.print("RESETREAS 0x");
-    oled.print(resetReas, HEX);
-    oled.setCursor(0, 50); oled.print("no WDT, no sleep");
-    oled.display();
-    bootDelay(2000);
   }
+  // (No safe-mode screen: safe mode never brought the display up. It says
+  // what it is on serial, which is the interface that still works.)
 
   // Mode-cycle (Shutdown -> Normal, the chip's nearest thing to a reset
   // command) + full config with read-back verify.
   bool cfgOK = false;
   if (mcpOK) {
+    bootStep("MCP9600 configure");
     for (int attempt = 1; attempt <= 3 && !cfgOK; attempt++) {
       cfgOK = mcpModeCycle(mcp);
       if (!cfgOK) {
@@ -771,8 +849,10 @@ void setup() {
   else if (!cfgOK)  sensorFailed("config failed");
   else { Serial.print("MCP9600 up @0x"); Serial.println(mcp.addr, HEX); }
 
+  bootStep("BLE bring-up");
   bleSetup();
 
+  bootStep("setup complete - entering loop()");
   Serial.println("D1 short = C/F toggle, long = pairing window\n");
 }
 
