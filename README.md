@@ -50,11 +50,23 @@ cast to int16 (UB). The logger treats readings older than 1 s as gone
 
 | Signal | XIAO pin |
 |---|---|
-| OLED SCL (hardware `Wire`, 400 kHz) | D5 |
+| OLED SCL (hardware `Wire`, 100 kHz) | D5 |
 | OLED SDA | D4 |
 | MCP9600 SCL (dedicated soft bus, ~50 kHz) | D3 |
 | MCP9600 SDA | D2 |
 | Button | D1 ↔ GND (`INPUT_PULLUP`) |
+
+> **The OLED bus speed is load bearing.** `OLED_I2C_HZ` is 100 kHz and must
+> be given to the *display driver* as well as to `Wire` — Adafruit_SSD1306
+> and SH110X default to 400 kHz and re-assert it around every transfer, so a
+> display constructed without those arguments ignores `Wire.setClock()`.
+> This core's `Wire` spins on TWIM events with **no timeout** (`while
+> (!_p_twim->EVENTS_STOPPED);` has no error escape at all), so a transfer
+> that goes wrong badly enough never returns and the watchdog turns it into
+> an exact 8 s reboot cycle. Running this bus at 400 kHz on the nRF52's
+> internal ~13 kΩ pullups — rise time near 1 µs against a 300 ns budget —
+> is what caused the 2026-07-26 boot loop. Fit real 1–2 kΩ pullups before
+> raising it.
 
 The MCP9600's bus is bit-banged with a per-transaction timeout and runs
 deliberately slow for EMI margin — the chip clock-stretches aggressively
@@ -71,12 +83,15 @@ is known to dislike. K-type polarity: **red is negative** (US ANSI).
   informational — the logger pairs by MAC or payload magic).
 - **Hold 10 s** — deep sleep (nRF52 System OFF, ~µA: radio silent, MCP9600
   in shutdown, display off — the enclosure has no power switch). A
-  countdown appears on-screen from ~2 s into the hold.
+  countdown appears on-screen from ~2 s into the hold. **Unplug USB
+  first**: the nRF52840 cannot hold System OFF with bus power present, so
+  the pod says `CAN'T SLEEP` and stays awake rather than resetting.
 - **Hold 5 s to wake** — the press wakes the chip, but boot drops straight
   back to sleep unless the button stays held for 5 s. Nothing is drawn
   during the gate, so a pocket bump never lights the screen or drains the
-  battery. (A watchdog reboot skips the gate — after a hang the pod comes
-  back broadcasting on its own.)
+  battery. Every level decision in the gate is debounced. (A watchdog
+  reboot skips the gate — after a hang the pod comes back broadcasting on
+  its own. So does safe mode, below.)
 
 The egg prints its MAC on serial and the OLED at boot — copy it into the
 logger's `SENSOREGG_MAC` define for strict pairing, or leave the logger's
@@ -103,9 +118,33 @@ Layered, most-specific first:
    counter restarting tells the logger's zombie detection the egg is live
    again. A watchdog reboot is reported on serial (`!! WATCHDOG REBOOT`)
    and as `WDT RESET` on the boot scan screen.
-4. **Fatal-boot retry**: a `FATAL` boot failure (probe absent) shows its
-   screen for 30 s, then hard-resets and retries, so a transient boot
-   glitch self-heals in the field.
+4. **Bring-up never reboots**: a missing or unhealthy MCP9600 shows
+   `NO SENSOR` and the pod boots anyway — radio and screen up, EGT on the
+   invalid sentinel, sensor re-detected and reconfigured by the recovery
+   tick above until it answers. Rebooting is the one recovery that cannot
+   fix a failing boot, and the old 30 s `FATAL` hard-reset turned an
+   absent sensor into an endless reboot cycle (and a pod that was
+   near-impossible to re-flash, because the USB CDC port vanished every
+   30 s).
+5. **The display bus is never entered blind**: the hardware `Wire` is the
+   only call in the sketch with no way back, so before the TWIM is allowed
+   near D4/D5 both lines must read released and high. If they don't, even
+   after a bus clear, the display is dropped and the pod boots serial + BLE
+   only — a pod broadcasting with a dark screen beats one that loops.
+6. **Boot-loop breaker**: boots are counted in `GPREGRET2`, which survives
+   every warm reset and System OFF and is cleared by a real power cycle. A
+   run that stays up 15 s clears the streak. Three boots without a healthy
+   run in between means something in bring-up is cycling, so the pod comes
+   up in **safe mode**: the watchdog is held off until `loop()` is actually
+   running, **the display is not brought up at all**, boot screens and deep
+   sleep are disabled, and sensor detection takes its shortest path. Safe
+   mode is deliberately boring — the point is a pod that sits still, holds
+   its USB enumeration and can be re-flashed without the DFU dance. It
+   reports itself, the boot count and `RESETREAS` on serial; power-cycle
+   after a good run to clear it.
+7. **Boot progress on serial**: each stage prints `[boot] <stage>` and
+   flushes before entering it, so if the pod ever hangs again the last line
+   on the wire names the step that hung.
 
 ## Libraries
 
