@@ -56,17 +56,20 @@ cast to int16 (UB). The logger treats readings older than 1 s as gone
 | MCP9600 SDA | D2 |
 | Button | D1 ↔ GND (`INPUT_PULLUP`) |
 
-> **The OLED bus speed is load bearing.** `OLED_I2C_HZ` is 100 kHz and must
-> be given to the *display driver* as well as to `Wire` — Adafruit_SSD1306
-> and SH110X default to 400 kHz and re-assert it around every transfer, so a
-> display constructed without those arguments ignores `Wire.setClock()`.
-> This core's `Wire` spins on TWIM events with **no timeout** (`while
-> (!_p_twim->EVENTS_STOPPED);` has no error escape at all), so a transfer
-> that goes wrong badly enough never returns and the watchdog turns it into
-> an exact 8 s reboot cycle. Running this bus at 400 kHz on the nRF52's
-> internal ~13 kΩ pullups — rise time near 1 µs against a 300 ns budget —
-> is what caused the 2026-07-26 boot loop. Fit real 1–2 kΩ pullups before
-> raising it.
+> **The hardware `Wire` on this core can hang forever.** It spins on TWIM
+> events with **no timeout** (`while (!_p_twim->EVENTS_STOPPED);` has no
+> error escape at all), so a transfer that goes wrong badly enough never
+> returns, and the watchdog turns that into an exact ~9 s reboot cycle
+> (8 s WDT + boot overhead) — the 2026-07-26 boot loop, field-confirmed
+> twice, the second time with the bus already back at 100 kHz. The sketch
+> therefore never enters `Wire` blind: the OLED must first ACK a real
+> addressed probe on a temporary, timeout-capable **soft bus** over the
+> same pins, and if a boot dies inside display bring-up anyway, the next
+> boot skips the display outright (the **display deadman**, below).
+> `OLED_I2C_HZ` (100 kHz) must be given to the *display driver* as well as
+> to `Wire` — Adafruit_SSD1306 and SH110X default to 400 kHz and re-assert
+> it around every transfer, so a display constructed without those
+> arguments ignores `Wire.setClock()`.
 
 The MCP9600's bus is bit-banged with a per-transaction timeout and runs
 deliberately slow for EMI margin — the chip clock-stretches aggressively
@@ -127,24 +130,33 @@ Layered, most-specific first:
    near-impossible to re-flash, because the USB CDC port vanished every
    30 s).
 5. **The display bus is never entered blind**: the hardware `Wire` is the
-   only call in the sketch with no way back, so before the TWIM is allowed
-   near D4/D5 both lines must read released and high. If they don't, even
-   after a bus clear, the display is dropped and the pod boots serial + BLE
-   only — a pod broadcasting with a dark screen beats one that loops.
-6. **Boot-loop breaker**: boots are counted in `GPREGRET2`, which survives
-   every warm reset and System OFF and is cleared by a real power cycle. A
-   run that stays up 15 s clears the streak. Three boots without a healthy
-   run in between means something in bring-up is cycling, so the pod comes
-   up in **safe mode**: the watchdog is held off until `loop()` is actually
-   running, **the display is not brought up at all**, boot screens and deep
-   sleep are disabled, and sensor detection takes its shortest path. Safe
-   mode is deliberately boring — the point is a pod that sits still, holds
-   its USB enumeration and can be re-flashed without the DFU dance. It
-   reports itself, the boot count and `RESETREAS` on serial; power-cycle
-   after a good run to clear it.
-7. **Boot progress on serial**: each stage prints `[boot] <stage>` and
-   flushes before entering it, so if the pod ever hangs again the last line
-   on the wire names the step that hung.
+   only call in the sketch with no way back, so the OLED must ACK a real
+   addressed probe on a temporary timeout-capable soft bus (bus clear +
+   START/address/ACK/STOP, every edge bounded) before the TWIM is allowed
+   near D4/D5. No ACK — absent, unpowered, or clamping the lines — and the
+   display is dropped: the pod boots serial + BLE only. A pod broadcasting
+   with a dark screen beats one that loops.
+6. **Display deadman**: bring-up records which stage it is entering in a
+   magic-tagged `.noinit` RAM block that survives warm resets. If the
+   previous run died inside display bring-up — the only stage that *can*
+   hang unrecoverably — the next boot skips the display outright and says
+   so. Converges in one reboot; a power cycle retries the display.
+7. **Boot-loop breaker**: consecutive boots without a healthy run are
+   counted in the same `.noinit` block (RAM is the trusted store — field
+   logs show `RESETREAS` and `GPREGRET2` come back scrubbed on this
+   board's bootloader, so registers are written but only reported as
+   evidence). A run that stays up 15 s clears the streak. Three boots
+   without a healthy run means bring-up is cycling, so the pod comes up in
+   **safe mode**: the watchdog is held off until `loop()` is actually
+   running, the display is not brought up at all, boot screens and deep
+   sleep are disabled. Safe mode is deliberately boring — the point is a
+   pod that sits still, holds its USB enumeration and can be re-flashed
+   without the DFU dance. Power-cycle after a good run to clear it.
+8. **Boot forensics on serial**: every boot prints one line with the boot
+   count, whether the RAM scratch survived, **which stage the previous run
+   died in**, the raw `GPREGRET2` byte and `RESETREAS`; each stage then
+   prints `[boot] <stage>`, flushed before entering it, so the last line
+   on the wire always names the step that hung.
 
 ## Libraries
 
