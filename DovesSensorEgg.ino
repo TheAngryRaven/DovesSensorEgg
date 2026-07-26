@@ -22,14 +22,15 @@
    Deep sleep needs USB UNPLUGGED: the nRF52840 cannot hold System OFF
    with bus power present, it just resets.
 
-   THE OLED BUS RUNS AT 100 kHz (OLED_I2C_HZ) and that number is load
-   bearing, not a preference. This core's Wire spins on TWIM events with
-   no timeout - see wireLinesIdleHigh() - so a transfer that goes wrong
-   badly enough never returns, and the watchdog turns that into an exact
-   8 s reboot cycle. Raising the bus to 400 kHz on the nRF52's internal
-   ~13 k pullups is what caused the 2026-07-26 boot loop. Note the speed
-   must be given to the DISPLAY DRIVER too: Adafruit_SSD1306/SH110X
-   default to 400 kHz and re-assert it around every transfer.
+   THE HARDWARE Wire ON THIS CORE CAN HANG FOREVER (no timeout on its
+   TWIM event spins - see oledSoftProbe()'s comment), and a hang in boot
+   is a watchdog loop. So the display is triple-gated: the OLED must ACK
+   a probe on a TEMPORARY timeout-capable soft bus before hardware Wire
+   is entered at all; if the previous run died inside display bring-up
+   (noinit scratch - the display deadman), the display is skipped for a
+   boot; and safe mode never brings it up. The bus runs at 100 kHz
+   (OLED_I2C_HZ), passed to the DISPLAY DRIVER too - Adafruit_SSD1306 /
+   SH110X default to 400 kHz and re-assert it around every transfer.
 
    NOTHING IN BRING-UP REBOOTS THE POD (2026-07-26). A missing or
    unhealthy MCP9600 boots degraded - radio and screen up, readings on
@@ -43,9 +44,9 @@
    WIRING (changed 2026-07-20): the MCP9600 lives on its OWN bit-banged
    I2C bus - SDA=D2, SCL=D3, ~50 kHz, 4.7k pullups recommended - so a
    wedged sensor can't take the OLED down and every transaction has a
-   timeout (see soft_i2c.h). The OLED stays on hardware Wire (D4/D5),
-   now at 400 kHz. The Adafruit MCP9600 library is no longer used; the
-   register driver is mcp9600.{h,cpp} over the soft bus.
+   timeout (see soft_i2c.h). The OLED stays on hardware Wire (D4/D5) at
+   100 kHz. The Adafruit MCP9600 library is no longer used; the register
+   driver is mcp9600.{h,cpp} over the soft bus.
 
    Libraries (Arduino Library Manager):
      Adafruit SH110X          (or Adafruit SSD1306 if you flip USE_SH1106 to 0)
@@ -141,21 +142,93 @@
 //     it wakes and resets immediately.
 // All three are fixed at the source below, but the pod also needs to be
 // able to break ANY future cycle on its own, including one we haven't
-// thought of. GPREGRET2 survives every warm reset (watchdog, soft reset,
-// pin reset) and System OFF, and is cleared by a real power cycle; the
-// Adafruit bootloader owns GPREGRET for the DFU magic and never touches
-// GPREGRET2. Boot increments a counter there; a run that stays healthy
-// for BOOT_HEALTHY_MS clears it. BOOT_SAFE_AFTER boots without a healthy
-// run in between means something in bring-up is cycling, so the pod comes
-// up in SAFE MODE: no watchdog until loop() is actually running, no boot
+// thought of. Boot increments a counter; a run that stays healthy for
+// BOOT_HEALTHY_MS clears it. BOOT_SAFE_AFTER boots without a healthy run
+// in between means something in bring-up is cycling, so the pod comes up
+// in SAFE MODE: no watchdog until loop() is actually running, no boot
 // delays, no deep-sleep gate, everything optional skipped. Safe mode is
 // deliberately boring — the point is a pod that sits still, holds its USB
 // enumeration and can be re-flashed without the DFU dance.
+//
+// STORAGE (revised 2026-07-26, round two): the counter lives in BOTH
+// GPREGRET2 and a .noinit RAM block, and the RAM copy is the one trusted.
+// The field log from the first fix showed "boot #1, RESETREAS 0x0" on
+// every single reboot of an active watchdog loop — RESETREAS should have
+// read DOG and the counter should have climbed, so something between the
+// reset and setup() (the bootloader is the suspect; this core's startup
+// is clean, we checked) scrubs the POWER registers, and the breaker built
+// on them never fired. SRAM is retained through watchdog and soft resets
+// on the nRF52840 and no bootloader scrubs the middle of the app's RAM,
+// so a magic-tagged noinit block survives exactly the resets we need to
+// count. Lost on a real power cycle — which is the correct reset for the
+// streak anyway. GPREGRET2 is still written and reported as evidence.
+//
+// The RAM block also records WHICH bring-up stage the previous run died
+// in. That powers a per-stage deadman: died in display bring-up last time
+// -> this boot skips the display outright (see the display block), which
+// converges in ONE reboot instead of BOOT_SAFE_AFTER.
 #define BOOT_TAG_MASK    0xF0
 #define BOOT_TAG_VALUE   0xB0  // canary: our counter vs. power-on garbage
 #define BOOT_COUNT_MASK  0x0F
 #define BOOT_SAFE_AFTER  3     // boots with no healthy run -> safe mode
 #define BOOT_HEALTHY_MS  15000 // loop() alive this long -> the boot "took"
+
+// Bring-up stages, recorded on the way IN to each. STAGE_LOOP means the
+// previous run made it through setup() entirely.
+enum BootStage : uint8_t {
+  STAGE_NONE = 0,
+  STAGE_EARLY,        // before the display block
+  STAGE_DISPLAY,      // display bring-up (the one no-way-back stage)
+  STAGE_MCP_DETECT,
+  STAGE_MCP_CONFIG,
+  STAGE_BLE,
+  STAGE_LOOP,
+};
+
+// Magic-tagged, inverse-checked so power-on garbage can't fake validity.
+// Uninitialised on purpose: the section is outside __bss_start__..__bss_end__
+// so the startup code never zeroes it and it rides through warm resets.
+struct BootScratch {
+  uint32_t magic;
+  uint8_t  count;      uint8_t countInv;
+  uint8_t  stage;      uint8_t stageInv;
+};
+#define SCRATCH_MAGIC 0xB007E663UL
+// The section-name suffix forces NOBITS ('@' comments out the assembler's
+// own trailing flags on ARM): this core's linker scripts have no .noinit
+// rule, and without the override GCC emits the orphan section as PROGBITS
+// — i.e. loadable content at a RAM address in the .hex. Placement is
+// link-order luck either way, so CI (and any local build) should confirm
+// the section stays outside __bss_start__..__bss_end__ and below
+// __HeapBase — it currently lands just before .bss.
+__attribute__((section(".noinit,\"aw\",%nobits@")))
+static BootScratch bootScratch;
+
+static bool scratchValid() {
+  return bootScratch.magic == SCRATCH_MAGIC &&
+         bootScratch.count == (uint8_t)~bootScratch.countInv &&
+         bootScratch.stage == (uint8_t)~bootScratch.stageInv;
+}
+
+static void scratchWrite(uint8_t count, uint8_t stage) {
+  bootScratch.magic    = SCRATCH_MAGIC;
+  bootScratch.count    = count;
+  bootScratch.countInv = (uint8_t)~count;
+  bootScratch.stage    = stage;
+  bootScratch.stageInv = (uint8_t)~stage;
+}
+
+static const char* stageName(uint8_t s) {
+  switch (s) {
+    case STAGE_EARLY:      return "early boot";
+    case STAGE_DISPLAY:    return "display bring-up";
+    case STAGE_MCP_DETECT: return "MCP9600 detect";
+    case STAGE_MCP_CONFIG: return "MCP9600 configure";
+    case STAGE_BLE:        return "BLE bring-up";
+    case STAGE_LOOP:       return "loop (ran)";
+    default:               return "none";
+  }
+}
 
 // ---- PW-ADV-1 payload (14 bytes, little-endian fields) --------------------
 // Bluefruit's addManufacturerData() passes the buffer through RAW - it does
@@ -177,6 +250,7 @@ uint32_t nRead    = 0;
 
 bool     safeMode  = false;   // boot-loop breaker tripped (see BOOT_* above)
 uint8_t  bootCount = 0;       // consecutive boots without a healthy run
+bool     displayDeadman = false;  // previous run died IN display bring-up
 
 uint16_t advSeq    = 0;
 uint32_t pairUntil = 0;       // millis deadline; 0 = pairing window closed
@@ -196,8 +270,8 @@ using pw_adv::c2f;
 //
 // The nRF52840 hardware WDT reboots out of ANY such hang: it is fed once
 // per loop() pass, so a wedge anywhere (I2C, OLED, BLE) trips it within
-// WDT_TIMEOUT_S. Boot then runs i2cBusClear(), which is exactly the
-// recovery a wedged bus needs, and the sequence counter restarting from 0
+// WDT_TIMEOUT_S. Boot then re-clears both sensor buses (the soft probes
+// each start with a bus clear), and the sequence counter restarting from 0
 // is how the logger's zombie detection sees the egg come back to life.
 // Once started the WDT cannot be stopped or re-configured.
 //
@@ -232,13 +306,15 @@ void bootDelay(uint32_t ms) {
   wdtPet();
 }
 
-// Name each stage of bring-up on the way IN, flushed immediately. When the
-// pod hangs, the last line on the wire is the step that hung — the 2026-07-26
-// loop had to be pinned down by measuring the reboot period against
-// WDT_TIMEOUT_S and reading the core's Wire source, because boot printed
-// nothing between the banner and a step three calls later. Serial.flush()
-// matters: without it the tail of the CDC FIFO dies with the hang.
-void bootStep(const char* what) {
+// Name each stage of bring-up on the way IN — on serial, flushed, AND in
+// the noinit scratch, so the next boot knows where this one died even if
+// nobody was watching the terminal. Serial.flush() matters twice over:
+// without it the tail of the CDC FIFO dies with the hang, and on this
+// core CDC output is not flushed automatically — a println right before
+// a hang is otherwise simply lost, which is why the first round of logs
+// showed nothing between the banner and a step three calls later.
+void bootStep(const char* what, uint8_t stage) {
+  scratchWrite(scratchValid() ? bootScratch.count : bootCount, stage);
   Serial.print("[boot] "); Serial.println(what);
   Serial.flush();
 }
@@ -422,28 +498,7 @@ void wakeHoldGate() {
   btnWaitRelease();
 }
 
-// -------------------------------------------------- I2C bus clear
-// A reset mid-transaction (e.g. reflashing while the MCP was being read)
-// can leave a slave driving SDA low - the address scan still half-works
-// but register reads fail. Standard recovery: clock SCL 9 times with SDA
-// released, then issue a STOP. Must run BEFORE Wire.begin().
-void i2cBusClear() {
-  pinMode(SDA, INPUT_PULLUP);
-  pinMode(SCL, OUTPUT);
-  for (int i = 0; i < 9; i++) {
-    digitalWrite(SCL, LOW);  delayMicroseconds(10);
-    digitalWrite(SCL, HIGH); delayMicroseconds(10);
-  }
-  // STOP condition: SDA low->high while SCL high.
-  pinMode(SDA, OUTPUT);
-  digitalWrite(SDA, LOW);  delayMicroseconds(10);
-  digitalWrite(SCL, HIGH); delayMicroseconds(10);
-  digitalWrite(SDA, HIGH); delayMicroseconds(10);
-  pinMode(SDA, INPUT_PULLUP);
-  pinMode(SCL, INPUT_PULLUP);
-}
-
-// -------------------------------------------------- hardware Wire safety
+// -------------------------------------------------- OLED probe (soft bus)
 // THE HARDWARE Wire ON THIS CORE CAN HANG FOREVER, AND THAT HANG IS A BOOT
 // LOOP. Wire_nRF52.cpp spins on raw TWIM events with no timeout:
 //
@@ -454,39 +509,42 @@ void i2cBusClear() {
 // If a transfer goes wrong badly enough that the TWIM never raises STOPPED,
 // endTransmission() never returns. There is no recovery from inside the
 // app: the watchdog fires 8 s later, boot runs into the same transfer, and
-// the pod cycles on an exact 8 s period until someone holds it in DFU. That
-// is the 2026-07-26 boot loop, and raising this bus to 400 kHz on internal
-// pullups is what walked us into it — scanBus() is the FIRST Wire transfer
-// of the boot and the only one the sketch's own setClock() governs (the
-// display driver overrides the clock for its own transfers, see
-// OLED_I2C_HZ), so it took the change head-on.
+// the pod cycles on an exact ~9 s period (8 s WDT + boot overhead) until
+// someone holds it in DFU. Field-confirmed twice on 2026-07-26 — the
+// second time with the sketch's own Wire clock already back at 100 kHz, so
+// bus speed alone was NOT the trigger; something about the first hardware
+// TWIM transaction on this bus wedges it.
 //
-// So bring-up never enters a Wire call blind. Both lines must read released
-// and high, with the pullups on and the TWIM out of the way, before the
-// peripheral is allowed to touch them; if they do not, the display is
-// dropped and the pod boots without it. A pod that broadcasts with no
-// screen is worth infinitely more than one that loops.
-bool wireLinesIdleHigh() {
-  pinMode(SDA, INPUT_PULLUP);
-  pinMode(SCL, INPUT_PULLUP);
-  delayMicroseconds(200);          // pullup + line capacitance settle
-  return digitalRead(SDA) == HIGH && digitalRead(SCL) == HIGH;
-}
-
-// -------------------------------------------------- OLED probe (Wire)
-// OLED only. The MCP9600 is NOT probed here anymore: blind START/STOP
-// probes are exactly what community experience says can confuse its
-// interface state machine, and it now lives on its own bus with a
-// proper ID handshake (mcpDetect). A bare probe is fine for the SSD1306.
-void scanBus() {
-  Serial.println("\n--- OLED probe (Wire) ---");
-  for (uint8_t a = 0x3C; a <= 0x3D; a++) {
-    Wire.beginTransmission(a);
-    if (Wire.endTransmission() != 0) continue;
-    Serial.print("  OLED at 0x"); Serial.println(a, HEX);
-    if (!oledAddr) oledAddr = a;
+// So the probing moved OFF the hardware Wire entirely. The OLED is probed
+// on a TEMPORARY timeout-capable soft bus over the same two pins: bus
+// clear, then a real addressed transaction (START, address, ACK check,
+// STOP) at each candidate address, every edge bounded. Only a live,
+// ACKing OLED earns hardware-Wire bring-up at all — an absent, unpowered
+// or line-clamping module fails the probe cleanly and the pod boots
+// without a display instead of entering a call that cannot return. The
+// probe also doubles as the bus-clear that used to run here (a reset
+// mid-transaction can leave a slave driving SDA low).
+//
+// A pod that broadcasts with no screen is worth infinitely more than one
+// that loops. The residual risk — OLED ACKs the soft probe but the TWIM
+// still wedges inside oled.begin() — is covered by the display deadman:
+// the noinit scratch records that we died in STAGE_DISPLAY and the next
+// boot skips the display outright.
+uint8_t oledSoftProbe() {
+  SoftI2C probe = {SDA, SCL,
+                   /*halfPeriodUs=*/5,        // ~100 kHz
+                   /*stretchTimeoutUs=*/2000};
+  softI2cBegin(probe);
+  softI2cBusClear(probe);
+  uint8_t found = 0;
+  for (uint8_t a = 0x3C; a <= 0x3D && !found; a++) {
+    if (softI2cWriteRead(probe, a, nullptr, 0, nullptr, 0) ==
+        SoftI2CStatus::kOk) {
+      found = a;
+    }
   }
-  if (!oledAddr) Serial.println("  no OLED -> serial only");
+  // Pins are left released (INPUT_PULLUP) for Wire to take over.
+  return found;
 }
 
 // -------------------------------------------------- debounced button
@@ -698,11 +756,29 @@ void setup() {
   // bumped before anything that could hang, or a cycle never gets counted
   // and never trips safe mode.
   const uint32_t resetReas = captureResetReason();
+  // NOTE: field logs show RESETREAS reads 0x0 even mid-watchdog-loop on
+  // this board — something before the sketch (the bootloader, most
+  // likely) scrubs it. These flags are therefore best-effort: fine for
+  // cosmetics (the WDT RESET banner), never load-bearing. The noinit
+  // scratch below is what actually has to survive.
   const bool wdtReboot = (resetReas & POWER_RESETREAS_DOG_Msk) != 0;
   const bool offWake   = (resetReas & POWER_RESETREAS_OFF_Msk) != 0;
 
-  bootCount = bootCountBump();
-  safeMode  = bootCount >= BOOT_SAFE_AFTER;
+  // Trusted store first: the noinit RAM scratch (survives warm resets,
+  // dies with real power loss). GPREGRET2 is bumped too, but only as
+  // evidence — the same field logs show it coming back 0 every boot.
+  const bool    ramValid  = scratchValid();
+  const uint8_t prevStage = ramValid ? bootScratch.stage
+                                     : (uint8_t)STAGE_NONE;
+  uint8_t ramCount = ramValid ? bootScratch.count : 0;
+  if (ramCount < 255) ramCount++;
+  const uint8_t regRaw   = bootRegGet();
+  const uint8_t regCount = bootCountBump();
+  bootCount = (ramCount > regCount) ? ramCount : regCount;
+  scratchWrite(ramCount, STAGE_EARLY);
+
+  safeMode       = bootCount >= BOOT_SAFE_AFTER;
+  displayDeadman = ramValid && prevStage == STAGE_DISPLAY;
 
   // Healthy boot: arm the watchdog first thing, so a hang anywhere reboots
   // the pod instead of zombifying it. Safe mode defers it to loop() — see
@@ -723,13 +799,21 @@ void setup() {
   while (!Serial && millis() < 3000) { wdtPet(); }  // don't block on battery
 
   Serial.println("\nDovesSensorEgg - wireless EGT pod (PW-ADV-1)");
+  // One forensic line with every storage source, so a log of a looping
+  // pod says which stores survive its resets and where the last run died.
   Serial.print("boot #"); Serial.print(bootCount);
-  Serial.print(" since last healthy run, RESETREAS 0x");
-  Serial.println(resetReas, HEX);
+  Serial.print(" since last healthy run (ram ");
+  Serial.print(ramValid ? "ok" : "lost");
+  Serial.print(", prev stage: "); Serial.print(stageName(prevStage));
+  Serial.print(", reg 0x"); Serial.print(regRaw, HEX);
+  Serial.print("), RESETREAS 0x"); Serial.println(resetReas, HEX);
+  Serial.flush();
   if (wdtReboot) {
     // The previous run hung (I2C wedge under ignition EMI is the known
-    // suspect) and the watchdog pulled us out. The i2cBusClear() below is
-    // exactly the recovery that wedge needs.
+    // suspect) and the watchdog pulled us out. The bus clears in the soft
+    // probes below are exactly the recovery that wedge needs. (This banner
+    // is best-effort: RESETREAS is scrubbed before us on this board, so
+    // its absence proves nothing - trust the "prev stage" field instead.)
     Serial.println("!! WATCHDOG REBOOT - previous run hung");
   }
   if (safeMode) {
@@ -741,49 +825,49 @@ void setup() {
   }
 
   // ---- display bring-up, the one part of boot that can hang unrecoverably.
-  // Safe mode skips it outright: the hardware Wire is the only call in this
-  // sketch with no way back, so a pod that has been cycling gets brought up
-  // without it. Serial and BLE do not need the display, and a pod on the air
-  // with a dark screen can at least be diagnosed and re-flashed.
-  bootStep("display bring-up");
+  // Three gates before the hardware Wire is allowed near D4/D5:
+  //   1. safe mode      - the pod has been cycling; don't even probe.
+  //   2. display deadman - the PREVIOUS run died in exactly this stage
+  //                        (noinit scratch says so); skip in one reboot
+  //                        instead of waiting out the safe-mode count.
+  //   3. soft probe     - the OLED must ACK a real addressed transaction
+  //                        on the timeout-capable soft bus first. Only a
+  //                        demonstrably live module earns the TWIM.
+  // Serial and BLE do not need the display; a pod on the air with a dark
+  // screen can be diagnosed and re-flashed.
+  bootStep("display bring-up", STAGE_DISPLAY);
   if (safeMode) {
     Serial.println("  safe mode - display skipped (hardware Wire not entered)");
+  } else if (displayDeadman) {
+    Serial.println("  !! previous boot died in display bring-up - display DISABLED");
+    Serial.println("     this boot. Serial + BLE only; power-cycle to retry the");
+    Serial.println("     display. Check the OLED module and D4/D5 wiring.");
   } else {
-    i2cBusClear();             // recover a slave wedged by a mid-read reset
-    bool linesOK = wireLinesIdleHigh();
-    if (!linesOK) {
-      Serial.println("  OLED bus not idle-high - re-running bus clear");
-      i2cBusClear();
-      linesOK = wireLinesIdleHigh();
-    }
-    if (!linesOK) {
-      // Entering the TWIM now is the hang. Refuse, and boot without it.
-      Serial.println("  !! OLED bus STILL held low (SDA/SCL) - skipping display.");
-      Serial.println("     Check D4/D5 wiring and pullups; serial + BLE only.");
+    const uint8_t probeAddr = oledSoftProbe();
+    if (!probeAddr) {
+      Serial.println("  no OLED ACK on soft probe (D4/D5) - booting without display");
     } else {
+      oledAddr = probeAddr;
+      Serial.print("  OLED ACKs at 0x"); Serial.println(oledAddr, HEX);
+      Serial.println("  entering hardware Wire (the no-way-back call)...");
+      Serial.flush();   // if boot dies here, the log must already say where
       Wire.begin();
       Wire.setClock(OLED_I2C_HZ);
-      delay(100);
-      scanBus();
-
-      if (oledAddr) {
-      #if USE_SH1106
-        oledOK = oled.begin(oledAddr, true);
-      #else
-        oledOK = oled.begin(SSD1306_SWITCHCAPVCC, oledAddr);
-      #endif
-        Serial.print("  OLED "); Serial.print(DRV_NAME);
-        Serial.println(oledOK ? " init ok" : " init FAILED");
-      } else {
-        Serial.println("  no OLED on bus - serial only");
-      }
+      delay(50);
+    #if USE_SH1106
+      oledOK = oled.begin(oledAddr, true);
+    #else
+      oledOK = oled.begin(SSD1306_SWITCHCAPVCC, oledAddr);
+    #endif
+      Serial.print("  OLED "); Serial.print(DRV_NAME);
+      Serial.println(oledOK ? " init ok" : " init FAILED");
     }
   }
 
   // MCP9600 on its own timeout-capable soft bus: proper ID handshake at
   // each candidate address (retried — a mid-conversion NACK is normal and
   // must never read as "absent"), never a blind probe.
-  bootStep("MCP9600 detect (soft bus D2/D3)");
+  bootStep("MCP9600 detect (soft bus D2/D3)", STAGE_MCP_DETECT);
   softI2cBegin(mcpBus);
   softI2cBusClear(mcpBus);
   mcp.bus = &mcpBus;
@@ -834,7 +918,7 @@ void setup() {
   // command) + full config with read-back verify.
   bool cfgOK = false;
   if (mcpOK) {
-    bootStep("MCP9600 configure");
+    bootStep("MCP9600 configure", STAGE_MCP_CONFIG);
     for (int attempt = 1; attempt <= 3 && !cfgOK; attempt++) {
       cfgOK = mcpModeCycle(mcp);
       if (!cfgOK) {
@@ -851,10 +935,10 @@ void setup() {
   else if (!cfgOK)  sensorFailed("config failed");
   else { Serial.print("MCP9600 up @0x"); Serial.println(mcp.addr, HEX); }
 
-  bootStep("BLE bring-up");
+  bootStep("BLE bring-up", STAGE_BLE);
   bleSetup();
 
-  bootStep("setup complete - entering loop()");
+  bootStep("setup complete - entering loop()", STAGE_LOOP);
   Serial.println("D1 short = C/F toggle, long = pairing window\n");
 }
 
@@ -880,6 +964,7 @@ void loop() {
   if (!bootConfirmed && millis() >= BOOT_HEALTHY_MS) {
     bootConfirmed = true;
     bootCountClear();
+    scratchWrite(0, STAGE_LOOP);   // RAM copy too - it is the trusted one
     Serial.println("boot confirmed healthy - reboot streak cleared");
   }
 
