@@ -1,16 +1,19 @@
 /* ==========================================================================
-   DovesSensorEgg - wireless EGT pod (PW-ADV-1 broadcaster)
+   DovesSensorEgg - wireless EGT pod (PW-ADV-2 broadcaster)
    XIAO nRF52840 + Adafruit MCP9600 + I2C OLED + button
 
    Boot -> bird splash -> scan I2C -> BLE up (MAC shown) -> live temp on
    screen + serial + BLE advertising.
 
-   BLE: pure BROADCASTER. EGT + cold junction are packed into a 14-byte
-   Manufacturer Specific Data AD structure ("PW-ADV-1") and advertised at
-   ~10 Hz under the name "PWEGT". The egg never accepts a connection; the
-   DovesDataLogger receives the broadcasts with a passive scan. nRF
-   Connect on a phone doubles as a live hex debugger (mfg data starts
-   FF FF 50 57, bytes 12-13 increment).
+   BLE: pure BROADCASTER. EGT + cold junction + aux thermistor + battery
+   are packed into a 16-byte Manufacturer Specific Data AD structure
+   ("PW-ADV-2") and advertised at ~10 Hz under the name "PWEGT". The egg
+   never accepts a connection; the DovesDataLogger receives the
+   broadcasts with a passive scan. nRF Connect on a phone doubles as a
+   live hex debugger (mfg data starts FF FF 50 57, bytes 12-13
+   increment). COMPAT: the logger's parser still requires version 0x01
+   and truncates at 14 bytes — until its v2 round lands, the logger
+   DROPS these frames; bench with nRF Connect.
 
    Button on D1: short press toggles C / F on the debug screen; long
    press (>1 s) opens a 30 s pairing window (advertises flags bit0 -
@@ -60,7 +63,9 @@
 #include <avr/dtostrf.h>     // dtostrf() needs its own header on this core
 
 #include "images.h"          // boot splash (the bird, from DovesDataLogger)
-#include "pw_adv_encode.h"   // PW-ADV-1 payload builder (host-tested)
+#include "pw_adv_encode.h"   // PW-ADV-2 payload builder (host-tested)
+#include "thermistor.h"      // aux NTC codec (host-tested)
+#include "battery.h"         // XIAO battery divider codec (host-tested)
 #include "soft_i2c.h"        // timeout-capable bit-banged bus (MCP9600)
 #include "mcp9600.h"         // register driver over the soft bus
 #include "mcp9600_regs.h"    // host-tested register codecs
@@ -114,7 +119,17 @@
 // D1 = button, D4/D5 = hardware Wire (OLED).
 #define MCP_SDA_PIN D2
 #define MCP_SCL_PIN D3
+// Aux thermistor: 100k NTC from THERM_PWR_PIN down to the sense node,
+// 100k fixed from the sense node to GND. Powered ONLY for the ~4 ms
+// around each read: no idle drain, no self-heating, nothing to leak in
+// System OFF. A0 is the XIAO's one remaining free analog pin; D6 is a
+// free digital pin doing power-gate duty (divider draw ~16 uA max —
+// microscopic against GPIO drive).
+#define THERM_PWR_PIN D6
+#define THERM_ADC_PIN A0
 #define READ_MS    100        // MCP @16-bit converts in ~63-80ms
+#define THERM_MS  1000        // aux thermistor tick (gated ~4 ms pulse)
+#define BATT_MS  30000        // battery tick (divider pulsed, not left on)
 #define ADV_MS     250        // payload rebuild tick (see ADV_INTERVAL_UNITS)
 #define DRAW_MS    200
 #define SERIAL_MS  250
@@ -242,14 +257,16 @@ static const char* stageName(uint8_t s) {
   }
 }
 
-// ---- PW-ADV-1 payload (14 bytes, little-endian fields) --------------------
+// ---- PW-ADV-2 payload (16 bytes, little-endian fields) --------------------
 // Bluefruit's addManufacturerData() passes the buffer through RAW - it does
 // NOT prepend a company ID - so bytes 0-1 of this array ARE the company ID
-// and the logger indexes the array identically. Layout:
-//   0-1  company ID FF FF     2-3  magic 'P' 'W'      4  proto version 01
+// and the logger indexes the array identically. v2 appends to v1: bytes
+// 0-13 keep their exact v1 offsets. Layout:
+//   0-1  company ID FF FF     2-3  magic 'P' 'W'      4  proto version 02
 //   5    flags (bit0 pairing, bit1 TC fault)
 //   6-7  EGT int16 deci-degC  8-9  CJ int16 deci-degC
-//   10   raw MCP9600 STATUS   11   battery stub FF    12-13 sequence
+//   10   raw MCP9600 STATUS   11   battery % (FF = unknown)
+//   12-13 sequence            14-15 thermistor int16 deci-degC
 SoftI2C mcpBus = {MCP_SDA_PIN, MCP_SCL_PIN,
                   /*halfPeriodUs=*/10,      // ~50 kHz: slow on purpose (EMI margin)
                   /*stretchTimeoutUs=*/5000};
@@ -259,6 +276,11 @@ uint8_t  oledAddr = 0;
 bool     oledOK   = false;
 bool     showF    = true;
 uint32_t nRead    = 0;
+
+// Latest aux readings, refreshed on their own ticks in loop(); the
+// payload rebuild just reads the cache.
+float    thermC     = NAN;
+uint8_t  batteryPct = pw_adv::kBatteryUnknown;
 
 bool     safeMode  = false;   // boot-loop breaker tripped (see BOOT_* above)
 uint8_t  bootCount = 0;       // consecutive boots without a healthy run
@@ -469,6 +491,8 @@ bool enterDeepSleep() {
   Serial.println("deep sleep - hold button 5 s to wake");
   Bluefruit.Advertising.stop();
   mcpShutdown(mcp);                        // MCP9600 shutdown mode (~uA)
+  digitalWrite(THERM_PWR_PIN, LOW);        // thermistor divider dead
+  pinMode(VBAT_ENABLE, INPUT);             // battery divider off (boot state)
   if (oledOK) {
     oled.clearDisplay();
     oled.display();
@@ -750,6 +774,50 @@ static bool mcpRuntimeLocate() {
   return false;
 }
 
+// -------------------------------------------------- aux ADC reads
+// Both reads are PULSED: the source is energized, allowed to settle,
+// sampled, and de-energized, so neither divider draws anything between
+// ticks or in deep sleep. Both set analogReference() at the call site —
+// it is global state in this core and the two reads need DIFFERENT
+// references, so nothing here may assume it.
+
+// Thermistor: ratiometric on purpose. D6 drives the divider at VDD and
+// AR_VDD4 makes VDD the ADC's full scale, so the supply voltage cancels
+// out of the ratio exactly — no calibration constant, no VDD-tolerance
+// error. The ~3 ms settle swamps the RC of the sense node (100k || 100k
+// into a few tens of pF is microseconds); the first sample after a
+// reference switch is discarded per SAADC habit, then 4 are averaged.
+// Total ~4 ms blocking once per THERM_MS — noise against the 100 ms
+// loop tick, not worth a state machine.
+float readThermistorC() {
+  digitalWrite(THERM_PWR_PIN, HIGH);
+  delay(3);
+  analogReference(AR_VDD4);
+  (void)analogRead(THERM_ADC_PIN);           // discard: reference settle
+  uint32_t sum = 0;
+  for (int i = 0; i < 4; i++) sum += (uint32_t)analogRead(THERM_ADC_PIN);
+  digitalWrite(THERM_PWR_PIN, LOW);
+  return thermistor::countsToC((uint16_t)(sum / 4));
+}
+
+// Battery: the XIAO's onboard 1M/510k divider, gated by VBAT_ENABLE
+// (P0.14, active LOW). The datalogger leaves it enabled forever; the
+// egg pulses it — enable, settle (the 1M leg into the ADC input is the
+// slow RC here, hence 5 ms), read, then back to Hi-Z INPUT, which is
+// the variant's boot state and draws nothing in System OFF. Uses the
+// default AR_INTERNAL 3.6 V full scale — battery::kScale is calibrated
+// against exactly that (see battery.h).
+uint8_t readBatteryPct() {
+  pinMode(VBAT_ENABLE, OUTPUT);
+  digitalWrite(VBAT_ENABLE, LOW);
+  delay(5);
+  analogReference(AR_INTERNAL);
+  (void)analogRead(PIN_VBAT);                // discard: reference settle
+  const uint16_t counts = (uint16_t)analogRead(PIN_VBAT);
+  pinMode(VBAT_ENABLE, INPUT);               // divider off (boot state)
+  return battery::voltsToPercent(battery::countsToVolts(counts));
+}
+
 // -------------------------------------------------- debounced button
 // Short press (release < BTN_LONG_MS) -> 1. Long press fires 2 ONCE while
 // still held at the threshold; the eventual release is then swallowed.
@@ -781,7 +849,7 @@ uint8_t btnEvent() {
   return longFired ? 0 : 1;              // release edge -> short press
 }
 
-// -------------------------------------------------- PW-ADV-1 encode
+// -------------------------------------------------- PW-ADV-2 encode
 // Byte layout + sentinel rules live in pw_adv_encode.{h,cpp} (pure,
 // host-tested against the logger's parser fixture — the wire contract).
 
@@ -796,7 +864,8 @@ void updateAdvertising(float egtC, float cjC, uint8_t st) {
   uint8_t payload[pw_adv::kPayloadLen];
   advSeq++;                                  // one increment per adv update
   pw_adv::buildPayload(payload, egtC, cjC, st,
-                       millis() < pairUntil, advSeq);
+                       millis() < pairUntil, advSeq,
+                       batteryPct, thermC);
 
   Bluefruit.Advertising.stop();
   Bluefruit.Advertising.clearData();
@@ -917,7 +986,7 @@ void drawScreen(float egtC, float cjC, uint8_t st) {
   // Blue: just the temperatures, centered. Widths are computed from the
   // formatted strings (dtostrf — this core's printf lacks reliable %f).
   char numBuf[12];
-  char lineBuf[20];
+  char lineBuf[32];
   if (isnan(egt)) {
     snprintf(lineBuf, sizeof(lineBuf), "---");
   } else {
@@ -928,12 +997,25 @@ void drawScreen(float egtC, float cjC, uint8_t st) {
   oled.setCursor((OLED_W - 18 * (int16_t)strlen(lineBuf)) / 2, 20);
   oled.print(lineBuf);
 
-  if (isnan(cj)) {
-    snprintf(lineBuf, sizeof(lineBuf), "CJ ---");
+  // Bottom status line: CJ, aux thermistor, battery. dtostrf per value
+  // (this core's printf lacks reliable %f), then one centered line.
+  // Worst case "CJ -12.3F -12.3 100%" = 20 glyphs of a 21-glyph budget
+  // (the C/F toggle letter rides on the CJ number; the middle figure is
+  // the aux thermistor in the same unit).
+  char thBuf[8];
+  if (isnan(cj)) snprintf(numBuf, sizeof(numBuf), "---");
+  else           dtostrf(cj, 1, 1, numBuf);
+  float th = showF ? c2f(thermC) : thermC;
+  if (isnan(th)) snprintf(thBuf, sizeof(thBuf), "---");
+  else           dtostrf(th, 1, 1, thBuf);
+  char pctBuf[6];
+  if (batteryPct == pw_adv::kBatteryUnknown) {
+    snprintf(pctBuf, sizeof(pctBuf), "--%%");
   } else {
-    dtostrf(cj, 1, 1, numBuf);
-    snprintf(lineBuf, sizeof(lineBuf), "CJ %s %c", numBuf, showF ? 'F' : 'C');
+    snprintf(pctBuf, sizeof(pctBuf), "%u%%", (unsigned)batteryPct);
   }
+  snprintf(lineBuf, sizeof(lineBuf), "CJ %s%c %s %s",
+           numBuf, showF ? 'F' : 'C', thBuf, pctBuf);
   oled.setTextSize(1);  // 6 px per glyph
   oled.setCursor((OLED_W - 6 * (int16_t)strlen(lineBuf)) / 2, 50);
   oled.print(lineBuf);
@@ -990,6 +1072,14 @@ void setup() {
 
   pinMode(BTN_PIN, INPUT_PULLUP);
   delay(5);   // let the internal pull-up actually pull the line up
+
+  // Aux ADC plumbing. The thermistor power gate idles LOW (divider
+  // dead); VBAT_ENABLE stays at its boot state (Hi-Z, divider off) and
+  // is pulsed only inside readBatteryPct(). analogReference is set at
+  // each call site, never here — the two reads need different ones.
+  pinMode(THERM_PWR_PIN, OUTPUT);
+  digitalWrite(THERM_PWR_PIN, LOW);
+  analogReadResolution(12);
 
   // Woken out of deep sleep by the button: demand the 5 s hold before
   // anything else powers up. (A watchdog reboot skips this — after a hang
@@ -1188,6 +1278,17 @@ void loop() {
   }
 
   static uint32_t tRead = 0, tAdv = 0, tDraw = 0, tSer = 0;
+  static uint32_t tTherm = 0, tBatt = 0;
+  // Aux ticks. tBatt starts one interval in the past so the first
+  // payload after boot carries a real battery byte, not 30 s of 0xFF.
+  if (millis() - tTherm >= THERM_MS) {
+    tTherm = millis();
+    thermC = readThermistorC();
+  }
+  if (tBatt == 0 || millis() - tBatt >= BATT_MS) {
+    tBatt = millis();
+    batteryPct = readBatteryPct();
+  }
   static float    egtC = NAN, cjC = NAN;
   static uint8_t  st = 0;
 
@@ -1302,6 +1403,12 @@ void loop() {
     if (st < 0x10) Serial.print("0");
     Serial.print(st, HEX);
     if (st & 0x10) Serial.print("   [INPUT RANGE - probe open/reversed?]");
+    Serial.print("    TH ");
+    Serial.print(thermC, 1);
+    Serial.print(" C    BAT ");
+    if (batteryPct == pw_adv::kBatteryUnknown) Serial.print("--");
+    else                                       Serial.print(batteryPct);
+    Serial.print("%");
     Serial.println();
   }
 }

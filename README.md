@@ -10,15 +10,22 @@ Wireless sensor backpack for
 [DovesDataLogger](https://github.com/TheAngryRaven/DovesDataLogger).
 
 A Seeed XIAO nRF52840 + Adafruit MCP9600 thermocouple amp reads a K-type
-EGT probe and **broadcasts** the reading in BLE advertising packets —
-protocol `PW-ADV-1`. The egg is a pure broadcaster: it never accepts a
+EGT probe (plus an aux 100k NTC thermistor and its own battery level) and
+**broadcasts** the readings in BLE advertising packets — protocol
+`PW-ADV-2`. The egg is a pure broadcaster: it never accepts a
 connection, so the logger receives it with a passive scan that cannot
 interfere with the logger's Insta360 camera link. A small SSD1306 OLED
 shows live temps for bench debugging.
 
-## Protocol — PW-ADV-1
+## Protocol — PW-ADV-2
 
-Manufacturer Specific Data, 14 bytes, advertised under the name `PWEGT`
+> **Logger compatibility:** the DovesDataLogger's parser is still on v1 —
+> it requires version `0x01` exactly and truncates received payloads at
+> 14 bytes, so it silently **drops** v2 frames until its parser round
+> lands. Bench-verify a v2 egg with nRF Connect (16-byte mfg data
+> starting `FF FF 50 57 02`).
+
+Manufacturer Specific Data, 16 bytes, advertised under the name `PWEGT`
 (multi-byte fields little-endian). Advertising interval is **111.875 ms
 — deliberately not 100 ms**: the logger scans on a 100 ms cycle, and
 equal periods phase-lock so the egg can park in the scanner's deaf zone
@@ -27,17 +34,24 @@ for seconds; an off-100 interval sweeps the phase instead. The payload
 probe's 0.5–3 s thermal time constant. The company ID is *inside* the
 array — Bluefruit passes the buffer through raw on both sides:
 
+v2 appends to v1 — bytes 0–13 keep their exact v1 offsets:
+
 | Byte | Field |
 |---|---|
 | 0–1 | Company ID `FF FF` (SIG test/internal) |
 | 2–3 | Magic `50 57` (`PW`) |
-| 4 | Protocol version `01` |
+| 4 | Protocol version `02` |
 | 5 | Flags: bit0 = pairing window, bit1 = TC fault |
 | 6–7 | EGT, int16 deci-°C (`0x8000` = invalid) |
 | 8–9 | Cold junction, int16 deci-°C (`0x8000` = invalid) |
 | 10 | Raw MCP9600 STATUS (reg 0x04; bit 4 = open probe) |
-| 11 | Battery % (stub, always `0xFF`) |
+| 11 | Battery % 0–100 (`0xFF` = unknown / no pack) |
 | 12–13 | Sequence counter (wraps) |
+| 14–15 | Aux thermistor, int16 deci-°C (`0x8000` = invalid) |
+
+An open/shorted thermistor divider is signalled by the `0x8000` sentinel
+alone — no flag bit. Budget: 3 (flags AD) + 18 (mfg AD) + 7 (name) =
+28 of the 31-byte legacy advertising payload.
 
 NaN / out-of-range readings are sent as the `0x8000` sentinel — never
 cast to int16 (UB). The logger treats readings older than 1 s as gone
@@ -55,6 +69,8 @@ cast to int16 (UB). The logger treats readings older than 1 s as gone
 | MCP9600 SCL (dedicated soft bus, ~50 kHz) | D3 |
 | MCP9600 SDA | D2 |
 | Button | D1 ↔ GND (`INPUT_PULLUP`) |
+| Thermistor sense (100k NTC divider midpoint) | A0/D0 |
+| Thermistor power gate | D6 |
 
 > **The hardware `Wire` on this core can hang forever.** It spins on TWIM
 > events with **no timeout** (`while (!_p_twim->EVENTS_STOPPED);` has no
@@ -78,14 +94,30 @@ cast to int16 (UB). The logger treats readings older than 1 s as gone
 
 ```
 left column, top to bottom          right column, top to bottom
-  D0                                  5V
+  D0  <- thermistor sense (A0)        5V
   D1  <- button (to GND)              GND
   D2  <- MCP9600 SDA                  3V3  <- both modules' VCC
   D3  <- MCP9600 SCL                  D10
   D4  <- OLED SDA  (chip SDA pin)     D9
   D5  <- OLED SCL  (chip SCL pin)     D8
-  D6                                  D7
+  D6  <- thermistor power gate        D7
 ```
+
+**Thermistor divider** (aux temperature, payload bytes 14–15): 100k NTC
+from **D6** to the sense node, 100k fixed from the sense node to **A0/D0
+and GND**. D6 is driven high only for the ~4 ms around each 1 Hz read —
+no idle drain, no self-heating, nothing left energized in deep sleep.
+The read is ratiometric (`AR_VDD4` reference = the same rail D6 drives),
+so no calibration constant exists; tune `THERM_R0/B/R_FIXED` in
+`thermistor.h` if the part deviates from 100k/3950.
+
+**Battery** (payload byte 11): the XIAO's onboard 1M/510k divider on
+`PIN_VBAT`, gated by `VBAT_ENABLE` and pulsed the same way (every 30 s).
+The counts→volts calibration (`×3.024`) is ported from DovesDataLogger,
+where it was empirically corrected against a true 4.20 V full charge;
+percent is the same linear 3.3 V = 0% … 4.2 V = 100% window. Below
+2.5 V the pod reports `0xFF` (unknown) — a USB-only bench with no pack
+must not broadcast a lying 0%.
 
 Both breakout modules also need **3V3 and GND**. Two buses going silent
 at the same time is almost always the shared power feed, not the data
