@@ -120,10 +120,28 @@ a local charge reservoir ~4000× the SAADC's sample cap. Optional extra:
 ~1 kΩ in series from the node into A0 for RF/pin protection (no ratio
 error — at DC the ADC draws from the cap, not through the resistor).
 
+**Troubleshooting tell**: the serial line's measured `R=` is ground
+truth, independent of the codec constants. If it reads a *suspiciously
+exact standard resistor value* at ambient, a literal resistor is in the
+harness where it shouldn't be — the 2026-07-27 hunt ended at `R=1.0k`,
+which turned out to be a mispicked part soldered in as the smoothing
+cap (real ceramics are marked `103`/`104` and have no color bands; they
+read as a brief kick then open on a meter, never a steady ohms value).
+`R=` at ambient also names any probe: ~110k = 100k/3950 class, ~11k =
+10k class (adjust `kR0`/`kB` in `thermistor.h`).
+
 When the divider reads `nan`, serial appends the raw ADC counts and
 which rail they peg: HIGH rail = the NTC leg isn't conducting (open
 joint / thermistor out of circuit), LOW rail = D6's drive isn't reaching
-the divider or A0 isn't on the node.
+the divider or A0 isn't on the node. After three consecutive `nan`
+reads the pod runs a **thermistor harness diagnostic** (repeating every
+15 s while the fault lasts, so a re-flowed joint shows up live): it
+distinguishes an open NTC leg from a node tied to a live rail, probes
+D7–D10 in case the power wire landed on the wrong pin (**and adopts it**
+for the session if found), checks whether a divider node is following
+the drive on one of the peripheral analog pins (sense wire misplaced),
+and finally charge-injects A0 to tell a floating sense wire (or a cap
+soldered in series with A0) from an open fixed-resistor leg.
 
 D6 is driven high only for the ~13 ms around each 1 Hz read — no idle
 drain, no self-heating, nothing left energized in deep sleep. **The cap
@@ -133,7 +151,7 @@ must be ≥ ~10 τ or cold readings come out low. The define in the sketch
 carries the table (10 nF → 12 ms, 100 nF → 75 ms, …) — change the cap,
 change the number. The read is ratiometric (`AR_VDD4` reference = the
 same rail D6 drives), so no calibration constant exists; tune
-`THERM_R0/B/R_FIXED` in `thermistor.h` if the part deviates from
+`kR0`/`kB`/`kRFixed` in `thermistor.h` if the part deviates from
 100k/3950.
 
 **Battery** (payload byte 11): the XIAO's onboard 1M/510k divider on
