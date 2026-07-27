@@ -138,7 +138,15 @@
 // advertising autonomously between payload rebuilds.)
 #define THERM_SETTLE_MS 12
 #define READ_MS    100        // MCP @16-bit converts in ~63-80ms
-#define THERM_MS  1000        // aux thermistor tick (gated ~4 ms pulse)
+#define THERM_MS  1000        // aux thermistor tick (gated ~14 ms pulse)
+// Cross-tick smoothing for the thermistor: exponential moving average,
+// time constant ~= THERM_MS/alpha ~= 4 s. Physically justified for
+// intake air - an airbox cannot change temperature faster than seconds
+// - and it matches the system's philosophy elsewhere (the MCP9600 runs
+// its on-chip filter at coefficient 3). Set to 1.0f to disable. The
+// filter NEVER smooths across a fault: an invalid read resets it, so
+// the 0x8000 sentinel still appears within one tick of an unplug.
+#define THERM_EMA_ALPHA 0.25f
 #define BATT_MS  30000        // battery tick (divider pulsed, not left on)
 #define ADV_MS     250        // payload rebuild tick (see ADV_INTERVAL_UNITS)
 #define DRAW_MS    200
@@ -290,7 +298,8 @@ uint32_t nRead    = 0;
 // Latest aux readings, refreshed on their own ticks in loop(); the
 // payload rebuild just reads the cache.
 float    thermC     = NAN;
-uint16_t thermRaw   = 0;      // last averaged ADC counts (fault forensics)
+uint16_t thermRaw   = 0;      // last burst counts, pre-filter (forensics)
+uint16_t thermFilt  = 0;      // filtered counts (what TH/R= report)
 uint8_t  thermPwrPin = THERM_PWR_PIN;  // runtime: diag adopts a misplaced wire
 uint8_t  batteryPct = pw_adv::kBatteryUnknown;
 
@@ -819,11 +828,35 @@ float readThermistorC() {
   delay(THERM_SETTLE_MS);
   analogReference(AR_VDD4);
   (void)analogRead(THERM_ADC_PIN);           // discard: reference settle
+  // Robust burst: 8 samples, min and max discarded, middle 6 averaged.
+  // A single EMI spike or acquisition glitch cannot move the result;
+  // the whole burst costs < 1 ms on top of the settle.
+  uint16_t s[8];
   uint32_t sum = 0;
-  for (int i = 0; i < 4; i++) sum += (uint32_t)analogRead(THERM_ADC_PIN);
+  uint16_t mn = 0xFFFF, mx = 0;
+  for (int i = 0; i < 8; i++) {
+    s[i] = (uint16_t)analogRead(THERM_ADC_PIN);
+    sum += s[i];
+    if (s[i] < mn) mn = s[i];
+    if (s[i] > mx) mx = s[i];
+  }
   digitalWrite(thermPwrPin, LOW);
-  thermRaw = (uint16_t)(sum / 4);            // kept for fault forensics
-  return thermistor::countsToC(thermRaw);
+  thermRaw = (uint16_t)((sum - mn - mx) / 6);  // pre-filter, for forensics
+
+  // Cross-tick EMA (see THERM_EMA_ALPHA). Faults reset the filter: nan
+  // must never be smoothed over, and recovery re-seeds instantly.
+  static float ema = NAN;
+  const bool valid = thermRaw >= thermistor::kCountsFloor &&
+                     thermRaw <= thermistor::kCountsCeiling;
+  if (!valid) {
+    ema = NAN;
+    thermFilt = thermRaw;
+    return NAN;
+  }
+  if (isnan(ema)) ema = (float)thermRaw;
+  else            ema += THERM_EMA_ALPHA * ((float)thermRaw - ema);
+  thermFilt = (uint16_t)(ema + 0.5f);
+  return thermistor::countsToC(thermFilt);
 }
 
 // -------------------------------------------------- thermistor harness diag
@@ -1606,7 +1639,7 @@ void loop() {
       // part. A "100k" input reading R=10k at ambient is a 10k probe;
       // R=1.9k means the fixed leg is not the value the math assumes.
       Serial.print(" (R=");
-      Serial.print(thermistor::countsToResistance(thermRaw) / 1000.0f, 1);
+      Serial.print(thermistor::countsToResistance(thermFilt) / 1000.0f, 1);
       Serial.print("k)");
     }
     if (isnan(thermC)) {

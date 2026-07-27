@@ -146,7 +146,17 @@ the drive on one of the peripheral analog pins (sense wire misplaced),
 and finally charge-injects A0 to tell a floating sense wire (or a cap
 soldered in series with A0) from an open fixed-resistor leg.
 
-D6 is driven high only for the ~13 ms around each 1 Hz read — no idle
+Thermistor reads are filtered twice: an 8-sample burst per read with
+min and max discarded (one EMI spike cannot move the result), then a
+cross-tick exponential average with a ~4 s time constant
+(`THERM_EMA_ALPHA`) — physically free for intake air, which cannot
+change faster than seconds. A fault resets the filter, so an unplug
+still hits the wire sentinel within one tick. The smoothing cap is
+still required hardware — the filter cleans up quantization and
+sampling noise, the cap is what keeps ignition EMI out of the ADC's
+acquisition window in the first place.
+
+D6 is driven high only for the ~14 ms around each 1 Hz read — no idle
 drain, no self-heating, nothing left energized in deep sleep. **The cap
 value and `THERM_SETTLE_MS` are coupled**: the node charges through the
 divider each pulse (worst-case τ = 100 kΩ × C, cold NTC), and the settle
