@@ -2,6 +2,8 @@
 
 #include <math.h>
 
+#include "nan_bits.h"
+
 namespace thermistor {
 
 float countsToResistance(uint16_t counts) {
@@ -13,7 +15,7 @@ float countsToResistance(uint16_t counts) {
 
 float countsToC(uint16_t counts) {
   const float r = countsToResistance(counts);
-  if (isnan(r)) return NAN;
+  if (isNanF(r)) return NAN;
   const float invT = 1.0f / kT0K + logf(r / kR0) / kB;
   return 1.0f / invT - 273.15f;
 }
