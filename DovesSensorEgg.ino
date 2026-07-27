@@ -1304,7 +1304,10 @@ void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000) { wdtPet(); }  // don't block on battery
 
-  Serial.println("\nDovesSensorEgg - wireless EGT pod (PW-ADV-1)");
+  // Protocol AND compile stamp: a serial log must never leave doubt
+  // about which build produced it (2026-07-27: a stale banner did).
+  Serial.println("\nDovesSensorEgg - wireless EGT pod (PW-ADV-2)");
+  Serial.println("build " __DATE__ " " __TIME__);
   // One forensic line with every storage source, so a log of a looping
   // pod says which stores survive its resets and where the last run died.
   Serial.print("boot #"); Serial.print(bootCount);
