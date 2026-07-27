@@ -69,7 +69,7 @@ cast to int16 (UB). The logger treats readings older than 1 s as gone
 | MCP9600 SCL (dedicated soft bus, ~50 kHz) | D3 |
 | MCP9600 SDA | D2 |
 | Button | D1 ↔ GND (`INPUT_PULLUP`) |
-| Thermistor sense (100k NTC divider midpoint) | A0/D0 |
+| Thermistor sense (NTC divider midpoint) | A0/D0 |
 | Thermistor power gate | D6 |
 
 > **The hardware `Wire` on this core can hang forever.** It spins on TWIM
@@ -94,7 +94,7 @@ cast to int16 (UB). The logger treats readings older than 1 s as gone
 
 ```
 left column, top to bottom          right column, top to bottom
-  D0  <- thermistor sense (A0)        5V
+  D0  <- thermistor sense node (A0)   5V
   D1  <- button (to GND)              GND
   D2  <- MCP9600 SDA                  3V3  <- both modules' VCC
   D3  <- MCP9600 SCL                  D10
@@ -103,10 +103,13 @@ left column, top to bottom          right column, top to bottom
   D6  <- thermistor power gate        D7
 ```
 
-**Thermistor divider** (aux temperature, payload bytes 14–15): 100k NTC
-from **D6** to the sense node, 100k fixed from the sense node to **A0/D0
-and GND**, and a **10 nF ceramic smoothing cap from the sense node to
-GND** — placed at the XIAO end of the leads, not out at the thermistor,
+**Thermistor divider** (aux temperature, payload bytes 14–15): 100k
+fixed resistor from **D6** to the sense node, 100k NTC from the sense
+node to **GND**, sense node to **A0/D0**, and a **10 nF ceramic
+smoothing cap from the sense node to GND** (in parallel with the NTC —
+NOT in series between the node and A0, which DC-blocks the pin and pegs
+the reading at the LOW rail) — placed at the XIAO end of the leads, not
+out at the thermistor,
 with the NTC run as a twisted pair (the leads live near ignition wiring
 and are antennas, same as the TC lead). The cap is load-bearing twice
 over: it low-passes ignition spikes (~320 Hz cutoff at mid-scale), and
@@ -116,6 +119,11 @@ divider's Thevenin impedance reaches ~100 kΩ with a cold NTC; the cap is
 a local charge reservoir ~4000× the SAADC's sample cap. Optional extra:
 ~1 kΩ in series from the node into A0 for RF/pin protection (no ratio
 error — at DC the ADC draws from the cap, not through the resistor).
+
+When the divider reads `nan`, serial appends the raw ADC counts and
+which rail they peg: HIGH rail = the NTC leg isn't conducting (open
+joint / thermistor out of circuit), LOW rail = D6's drive isn't reaching
+the divider or A0 isn't on the node.
 
 D6 is driven high only for the ~13 ms around each 1 Hz read — no idle
 drain, no self-heating, nothing left energized in deep sleep. **The cap
