@@ -7,16 +7,19 @@
 // Celsius. Arduino-free, following the repo's pw_adv / mcp9600_regs
 // extraction pattern; the ADC plumbing lives in the sketch.
 //
-// Electrical contract (see the sketch + README):
-//   - Divider: NTC from the power-gate GPIO (driven to VDD during the
-//     read) to the sense node; R_FIXED from the sense node to GND.
-//       Vout / Vdd = R_FIXED / (R_FIXED + R_NTC)
+// Electrical contract (see the sketch + README) — matches the
+// as-built harness (2026-07-27): R_FIXED from the power-gate GPIO
+// (driven to VDD during the read) down to the sense node; NTC from the
+// sense node to GND.
+//       Vout / Vdd = R_NTC / (R_FIXED + R_NTC)
 //   - ADC: 12-bit, AR_VDD4 reference -> full scale == VDD, the same
 //     rail the GPIO drives the divider with. The supply cancels out of
 //     the ratio EXACTLY, so there is no calibration constant here.
-//   - Counts pegged at either rail mean an open or shorted divider
-//     (thermistor unplugged, wiring fault): NAN, which the payload
-//     encoder turns into the 0x8000 wire sentinel.
+//   - Counts pegged at either rail mean an open or shorted divider:
+//     NAN, which the payload encoder turns into the 0x8000 wire
+//     sentinel. In this topology, HIGH rail = the NTC leg is not
+//     conducting (open joint, thermistor missing); LOW rail = no drive
+//     from the power gate, or the sense line is not on the node.
 //   - A smoothing cap (10 nF default) sits on the sense node at the
 //     board end — invisible to this math, but the sketch's
 //     THERM_SETTLE_MS must cover its charge time (they are coupled;

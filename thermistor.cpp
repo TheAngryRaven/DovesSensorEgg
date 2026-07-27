@@ -6,9 +6,9 @@ namespace thermistor {
 
 float countsToResistance(uint16_t counts) {
   if (counts < kCountsFloor || counts > kCountsCeiling) return NAN;
-  // Vout/Vdd = counts/kAdcMax = kRFixed / (kRFixed + Rntc)
-  //   -> Rntc = kRFixed * (kAdcMax - counts) / counts
-  return kRFixed * ((float)(kAdcMax - counts)) / (float)counts;
+  // Vout/Vdd = counts/kAdcMax = Rntc / (kRFixed + Rntc)
+  //   -> Rntc = kRFixed * counts / (kAdcMax - counts)
+  return kRFixed * (float)counts / ((float)(kAdcMax - counts));
 }
 
 float countsToC(uint16_t counts) {

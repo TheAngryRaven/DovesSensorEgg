@@ -119,12 +119,12 @@
 // D1 = button, D4/D5 = hardware Wire (OLED).
 #define MCP_SDA_PIN D2
 #define MCP_SCL_PIN D3
-// Aux thermistor: 100k NTC from THERM_PWR_PIN down to the sense node,
-// 100k fixed from the sense node to GND. Powered ONLY for the ~4 ms
-// around each read: no idle drain, no self-heating, nothing to leak in
-// System OFF. A0 is the XIAO's one remaining free analog pin; D6 is a
-// free digital pin doing power-gate duty (divider draw ~16 uA max —
-// microscopic against GPIO drive).
+// Aux thermistor (as built): 100k FIXED from THERM_PWR_PIN down to the
+// sense node, 100k NTC from the sense node to GND, smoothing cap on the
+// node. Powered ONLY for the ~13 ms around each read: no idle drain, no
+// self-heating, nothing to leak in System OFF. A0 is the XIAO's one
+// remaining free analog pin; D6 is a free digital pin doing power-gate
+// duty (divider draw ~16 uA max — microscopic against GPIO drive).
 #define THERM_PWR_PIN D6
 #define THERM_ADC_PIN A0
 // Power-gate settle before sampling. Sized for the SMOOTHING CAP on the
@@ -290,6 +290,7 @@ uint32_t nRead    = 0;
 // Latest aux readings, refreshed on their own ticks in loop(); the
 // payload rebuild just reads the cache.
 float    thermC     = NAN;
+uint16_t thermRaw   = 0;      // last averaged ADC counts (fault forensics)
 uint8_t  batteryPct = pw_adv::kBatteryUnknown;
 
 bool     safeMode  = false;   // boot-loop breaker tripped (see BOOT_* above)
@@ -820,7 +821,8 @@ float readThermistorC() {
   uint32_t sum = 0;
   for (int i = 0; i < 4; i++) sum += (uint32_t)analogRead(THERM_ADC_PIN);
   digitalWrite(THERM_PWR_PIN, LOW);
-  return thermistor::countsToC((uint16_t)(sum / 4));
+  thermRaw = (uint16_t)(sum / 4);            // kept for fault forensics
+  return thermistor::countsToC(thermRaw);
 }
 
 // Battery: the XIAO's onboard 1M/510k divider, gated by VBAT_ENABLE
@@ -1428,7 +1430,20 @@ void loop() {
     if (st & 0x10) Serial.print("   [INPUT RANGE - probe open/reversed?]");
     Serial.print("    TH ");
     Serial.print(thermC, 1);
-    Serial.print(" C    BAT ");
+    Serial.print(" C");
+    if (isnan(thermC)) {
+      // Rail-pegged divider: say WHICH rail, because in this topology
+      // (fixed leg on D6, NTC to GND) they mean different faults.
+      Serial.print(" (raw ");
+      Serial.print(thermRaw);
+      if (thermRaw >= thermistor::kCountsCeiling) {
+        Serial.print(" HIGH rail - NTC leg open?");
+      } else {
+        Serial.print(" LOW rail - no D6 drive, or A0 not on the node?");
+      }
+      Serial.print(")");
+    }
+    Serial.print("    BAT ");
     if (batteryPct == pw_adv::kBatteryUnknown) Serial.print("--");
     else                                       Serial.print(batteryPct);
     Serial.print("%");
