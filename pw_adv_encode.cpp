@@ -12,13 +12,15 @@ int16_t encodeDeciC(float c) {
 float c2f(float c) { return c * 9.0f / 5.0f + 32.0f; }
 
 void buildPayload(uint8_t out[kPayloadLen], float egtC, float cjC,
-                  uint8_t status, bool pairingActive, uint16_t seq) {
+                  uint8_t status, bool pairingActive, uint16_t seq,
+                  uint8_t batteryPct, float thermC) {
   uint8_t flags = 0;
   if (pairingActive)                    flags |= kFlagPairing;
   if (status & kStatusInputRangeMask)   flags |= kFlagTcFault;
 
   const int16_t egt = encodeDeciC(egtC);
   const int16_t cj  = encodeDeciC(cjC);
+  const int16_t th  = encodeDeciC(thermC);
 
   out[0]  = 0xFF; out[1] = 0xFF;             // company ID (SIG test/internal)
   out[2]  = 'P';  out[3] = 'W';              // magic
@@ -29,9 +31,11 @@ void buildPayload(uint8_t out[kPayloadLen], float egtC, float cjC,
   out[8]  = (uint8_t)(cj & 0xFF);
   out[9]  = (uint8_t)((cj >> 8) & 0xFF);
   out[10] = status;
-  out[11] = 0xFF;                            // battery: stub
+  out[11] = batteryPct;
   out[12] = (uint8_t)(seq & 0xFF);
   out[13] = (uint8_t)((seq >> 8) & 0xFF);
+  out[14] = (uint8_t)(th & 0xFF);
+  out[15] = (uint8_t)((th >> 8) & 0xFF);
 }
 
 }  // namespace pw_adv
