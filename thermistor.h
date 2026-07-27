@@ -35,10 +35,18 @@
 
 namespace thermistor {
 
-// Part constants — 100k NTC, B ~= 3950 (user's part), 100k fixed leg.
+// Part constants. Two probe classes have been identified on this bench
+// (2026-07-27) by the serial line's measured-R readout — pick ONE:
+//
+//   Glass bead "Ender 3" spare: 100k @25C, B 3950 (reads ~109k at 23C)
+//     -> the values below, with the 100k fixed leg. CURRENT CONFIG.
+//   Sealed metal-tube probe: 10k class (reads ~10.9k at ambient)
+//     -> kR0 = 10000, kB ~= 3950 (some are 3435 - calibrate against a
+//        known temp), and ideally kRFixed = 10000 to re-center the
+//        divider's sensitivity on the interesting range.
 constexpr float kR0     = 100000.0f;  // NTC resistance at 25 C
 constexpr float kB      = 3950.0f;    // B25/85 coefficient
-constexpr float kRFixed = 100000.0f;  // divider bottom leg (to GND)
+constexpr float kRFixed = 100000.0f;  // divider top leg (power gate side)
 constexpr float kT0K    = 298.15f;    // 25 C in kelvin
 
 constexpr uint16_t kAdcMax = 4096;    // 12-bit SAADC (core convention)
