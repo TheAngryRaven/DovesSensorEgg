@@ -10,7 +10,8 @@ Wireless sensor backpack for
 [DovesDataLogger](https://github.com/TheAngryRaven/DovesDataLogger).
 
 A Seeed XIAO nRF52840 + Adafruit MCP9600 thermocouple amp reads a K-type
-EGT probe (plus an aux 100k NTC thermistor and its own battery level) and
+EGT probe (plus an aux NTC thermistor for intake air and its own
+battery level) and
 **broadcasts** the readings in BLE advertising packets — protocol
 `PW-ADV-2`. The egg is a pure broadcaster: it never accepts a
 connection, so the logger receives it with a passive scan that cannot
@@ -104,8 +105,10 @@ left column, top to bottom          right column, top to bottom
 ```
 
 **Thermistor divider** (aux temperature, payload bytes 14–15): 100k
-fixed resistor from **D6** to the sense node, 100k NTC from the sense
-node to **GND**, sense node to **A0/D0**, and a **10 nF ceramic
+fixed resistor from **D6** to the sense node, the NTC from the sense
+node to **GND** (currently the sealed 10k metal probe for intake-air
+duty — profiles and the deliberate 10k-against-100k "lazy divider"
+math live in `thermistor.h`), sense node to **A0/D0**, and a **10 nF ceramic
 smoothing cap from the sense node to GND** (in parallel with the NTC —
 NOT in series between the node and A0, which DC-blocks the pin and pegs
 the reading at the LOW rail) — placed at the XIAO end of the leads, not

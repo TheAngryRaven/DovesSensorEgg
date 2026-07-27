@@ -8,13 +8,16 @@
 using namespace thermistor;
 
 // The divider is NTC-on-the-bottom (as built): counts/4096 =
-// Rntc/(Rfix+Rntc). With R0 == kRFixed (100k/100k), R = R0 lands at
-// exactly mid-scale.
+// Rntc/(Rfix+Rntc). Current config: 10k/3950 probe against the
+// physical 100k fixed leg (the deliberate "lazy" divider — see
+// thermistor.h).
 
-TEST_CASE("thermistor - R0 at mid-scale reads 25.0 C") {
-    // counts = 4096 * R0/(Rfix+R0) = 2048 when Rfix == R0.
-    CHECK(countsToResistance(2048) == doctest::Approx(kR0).epsilon(0.001));
-    CHECK(countsToC(2048) == doctest::Approx(25.0f).epsilon(0.01));
+TEST_CASE("thermistor - resistance recovery is ratio-exact") {
+    // Mid-scale means Rntc == kRFixed, whatever the probe class.
+    CHECK(countsToResistance(2048) == doctest::Approx(kRFixed).epsilon(0.001));
+    // R0 (10k) lands at counts = 4096 * 10/(110) ~= 372 -> 25 C.
+    CHECK(countsToResistance(372) == doctest::Approx(kR0).epsilon(0.005));
+    CHECK(countsToC(372) == doctest::Approx(25.0f).epsilon(0.01));
 }
 
 TEST_CASE("thermistor - monotonic: more counts (higher R) = colder") {
@@ -27,13 +30,13 @@ TEST_CASE("thermistor - monotonic: more counts (higher R) = colder") {
     }
 }
 
-TEST_CASE("thermistor - B-equation spot checks for a 100k/3950 part") {
+TEST_CASE("thermistor - B-equation spot checks for a 10k/3950 part") {
     // R(T) = R0 * exp(B * (1/T - 1/T0)); counts = 4096*R/(Rfix+R).
-    // 0 C  -> R ~= 336.6k -> counts ~= 3157 (Approx near zero is
+    // 0 C  -> R ~= 33.62k -> counts ~= 1031 (Approx near zero is
     // relative, so bound the absolute error directly)
-    // 50 C -> R ~= 35.85k -> counts ~= 1081
-    CHECK(std::fabs(countsToC(3157)) < 0.2f);
-    CHECK(countsToC(1081) == doctest::Approx(50.0f).epsilon(0.01));
+    // 50 C -> R ~= 3.588k -> counts ~= 142
+    CHECK(std::fabs(countsToC(1031)) < 0.2f);
+    CHECK(countsToC(142) == doctest::Approx(50.0f).epsilon(0.01));
 }
 
 TEST_CASE("thermistor - rail-pegged counts are a fault, not a temperature") {

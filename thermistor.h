@@ -38,14 +38,25 @@ namespace thermistor {
 // Part constants. Two probe classes have been identified on this bench
 // (2026-07-27) by the serial line's measured-R readout — pick ONE:
 //
-//   Glass bead "Ender 3" spare: 100k @25C, B 3950 (reads ~109k at 23C)
-//     -> the values below, with the 100k fixed leg. CURRENT CONFIG.
 //   Sealed metal-tube probe: 10k class (reads ~10.9k at ambient)
-//     -> kR0 = 10000, kB ~= 3950 (some are 3435 - calibrate against a
-//        known temp), and ideally kRFixed = 10000 to re-center the
-//        divider's sensitivity on the interesting range.
-constexpr float kR0     = 100000.0f;  // NTC resistance at 25 C
-constexpr float kB      = 3950.0f;    // B25/85 coefficient
+//     -> the values below. CURRENT CONFIG: intake-air duty, sealed
+//        housing, and the low impedance buys ~10x EMI margin.
+//   Glass bead "Ender 3" spare: 100k @25C, B 3950 (reads ~109k at 23C)
+//     -> kR0 = 100000.0f, kB = 3950.
+//
+// kRFixed stays the PHYSICAL 100k on purpose (the "lazy" config,
+// deliberate): against the 10k probe over the intake range (-1..43 C)
+// it costs ~0.14 C/count at the hot end vs 0.03 with a matched 10k leg
+// — at or beyond the wire format's 0.1 C granularity either way — and
+// the rail guard isn't reached until ~120 C. Re-centering with a 10k
+// fixed leg is polish, not a requirement; if the resistor is ever
+// swapped, kRFixed MUST follow the copper.
+//
+// kB: 10k probes ship as B~3950 and B~3435. Default 3950; the decisive
+// test is ice water — a 3435 part decoded with 3950 reads ~+3 C at
+// 0 C true (ambient agreement proves nothing: R0 anchors 25 C).
+constexpr float kR0     = 10000.0f;   // NTC resistance at 25 C
+constexpr float kB      = 3950.0f;    // B25/85 coefficient (see note)
 constexpr float kRFixed = 100000.0f;  // divider top leg (power gate side)
 constexpr float kT0K    = 298.15f;    // 25 C in kelvin
 
