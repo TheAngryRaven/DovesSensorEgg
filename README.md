@@ -296,6 +296,23 @@ driven by the in-repo `mcp9600.{h,cpp}` register driver over the
 timeout-capable `soft_i2c` bus (register codecs host-tested in
 `mcp9600_regs`).
 
+## The -Ofast rule
+
+The Seeed nRF52 platform compiles sketches with **`-Ofast`**, which
+includes `-ffinite-math-only`: **`isnan()` is constant-folded to
+`false`** and NaN comparisons are optimized on the assumption NaN can't
+exist. Field-confirmed 2026-07-27 — every `isnan()`-gated branch in
+device code was silently compiled out (the thermistor filter never
+seeded and manufactured a permanent `nan`; the `nan` serial forensics
+never printed in *any* build; the payload's NaN→`0x8000` sentinel guard
+could have cast garbage onto the wire). Host builds don't use `-Ofast`,
+so the test suite was blind to all of it.
+
+Device-compiled code therefore uses `isNanF()` from `nan_bits.h` — a
+bit-pattern check the optimizer cannot fold — and never compares a
+possibly-NaN float before checking it. Plain `isnan()` is allowed in
+host-only code.
+
 ## CI & tests
 
 Two deliberately-basic GitHub Actions workflows (same shapes as the

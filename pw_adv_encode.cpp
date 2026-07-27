@@ -2,10 +2,17 @@
 
 #include <math.h>
 
+#include "nan_bits.h"
+
 namespace pw_adv {
 
 int16_t encodeDeciC(float c) {
-  if (isnan(c) || c < -270.0f || c > 1400.0f) return INT16_MIN;
+  // isNanF, not isnan: the device build is -Ofast, where isnan() folds
+  // to false and a NaN would fall through into lroundf -> garbage on
+  // the wire instead of the 0x8000 sentinel. The NaN check must come
+  // FIRST for the same reason - the range comparisons below are only
+  // meaningful once c is known to be a real number.
+  if (isNanF(c) || c < -270.0f || c > 1400.0f) return INT16_MIN;
   return (int16_t)lroundf(c * 10.0f);
 }
 
