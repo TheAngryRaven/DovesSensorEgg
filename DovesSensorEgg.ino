@@ -291,6 +291,7 @@ uint32_t nRead    = 0;
 // payload rebuild just reads the cache.
 float    thermC     = NAN;
 uint16_t thermRaw   = 0;      // last averaged ADC counts (fault forensics)
+uint8_t  thermPwrPin = THERM_PWR_PIN;  // runtime: diag adopts a misplaced wire
 uint8_t  batteryPct = pw_adv::kBatteryUnknown;
 
 bool     safeMode  = false;   // boot-loop breaker tripped (see BOOT_* above)
@@ -502,7 +503,7 @@ bool enterDeepSleep() {
   Serial.println("deep sleep - hold button 5 s to wake");
   Bluefruit.Advertising.stop();
   mcpShutdown(mcp);                        // MCP9600 shutdown mode (~uA)
-  digitalWrite(THERM_PWR_PIN, LOW);        // thermistor divider dead
+  digitalWrite(thermPwrPin, LOW);          // thermistor divider dead
   pinMode(VBAT_ENABLE, INPUT);             // battery divider off (boot state)
   if (oledOK) {
     oled.clearDisplay();
@@ -814,15 +815,150 @@ static bool mcpRuntimeLocate() {
 // at a true 4.20 V). Thermistor gets the cap + default TACQ; battery
 // gets untouched TACQ + the verbatim calibration. They move together.
 float readThermistorC() {
-  digitalWrite(THERM_PWR_PIN, HIGH);
+  digitalWrite(thermPwrPin, HIGH);
   delay(THERM_SETTLE_MS);
   analogReference(AR_VDD4);
   (void)analogRead(THERM_ADC_PIN);           // discard: reference settle
   uint32_t sum = 0;
   for (int i = 0; i < 4; i++) sum += (uint32_t)analogRead(THERM_ADC_PIN);
-  digitalWrite(THERM_PWR_PIN, LOW);
+  digitalWrite(thermPwrPin, LOW);
   thermRaw = (uint16_t)(sum / 4);            // kept for fault forensics
   return thermistor::countsToC(thermRaw);
+}
+
+// -------------------------------------------------- thermistor harness diag
+// Same philosophy as the I2C harness diagnostic: a persistent nan is a
+// WIRING statement, and the pod can localize it without a multimeter.
+// Runs from loop() after a few consecutive rail-pegged reads, then every
+// 15 s while the fault lasts, so re-flowing a joint shows up live. All
+// experiments are bounded GPIO/ADC pokes on pins that are free in the
+// canonical wiring.
+//
+// Decision tree (as-built divider: fixed leg from the power pin down to
+// the sense node, NTC from the node to GND):
+//   drive HIGH -> valid counts        intermittent - normal path recovers
+//   drive HIGH -> HIGH rail:
+//     drive LOW also HIGH             node tied to a live rail (3V3?)
+//     drive LOW goes LOW              drive works, no load -> NTC leg open
+//   drive HIGH -> LOW rail (no response):
+//     one of D7-D10 moves A0          power wire on the wrong pin -> ADOPT
+//     a peripheral analog pin follows the drive
+//                                     sense wire on the wrong pin -> report
+//     A0 charge-injection holds       A0 floating: sense wire not on the
+//                                     node, or the cap is IN SERIES with A0
+//     A0 charge-injection decays      A0 loaded but nothing drives the node
+//                                     -> fixed-resistor leg open
+static uint16_t thermReadAt(uint8_t drivePin, bool high) {
+  digitalWrite(drivePin, high ? HIGH : LOW);
+  delay(THERM_SETTLE_MS);
+  analogReference(AR_VDD4);
+  (void)analogRead(THERM_ADC_PIN);
+  return (uint16_t)analogRead(THERM_ADC_PIN);
+}
+
+void thermDiagnose() {
+  Serial.print("[therm] diag: ");
+
+  const uint16_t cHi = thermReadAt(thermPwrPin, true);
+  const uint16_t cLo = thermReadAt(thermPwrPin, false);
+
+  if (cHi >= thermistor::kCountsFloor && cHi <= thermistor::kCountsCeiling) {
+    Serial.print("reads fine right now (");
+    Serial.print(cHi);
+    Serial.println(" counts) - intermittent joint?");
+    Serial.flush();
+    return;
+  }
+
+  if (cHi > thermistor::kCountsCeiling) {
+    if (cLo > thermistor::kCountsCeiling) {
+      Serial.println("node HIGH even with drive low - sense node tied to a live rail (3V3?)");
+    } else {
+      Serial.print("drive OK (high ");
+      Serial.print(cHi);
+      Serial.print(" / low ");
+      Serial.print(cLo);
+      Serial.println(") but no NTC load - NTC leg open, reflow its joints");
+    }
+    Serial.flush();
+    return;
+  }
+
+  // LOW rail: A0 sees nothing from the drive pin. Hunt for the divider.
+  Serial.print("no response on D");
+  Serial.print(thermPwrPin);
+  Serial.println(" (LOW rail); probing...");
+
+  // Is the power wire on a different free pin? These are all unused in
+  // the canonical wiring, so a brief high pulse is safe - and if the
+  // divider answers, adopt that pin for the session.
+  static const uint8_t kAltDrive[] = {D7, D8, D9, D10};
+  for (uint8_t pin : kAltDrive) {
+    pinMode(pin, OUTPUT);
+    const uint16_t c = thermReadAt(pin, true);
+    digitalWrite(pin, LOW);
+    if (c > 200) {
+      thermPwrPin = pin;                     // leave it OUTPUT LOW: adopted
+      Serial.print("[therm]   divider answers on D");
+      Serial.print(pin);
+      Serial.print(" (");
+      Serial.print(c);
+      Serial.println(" counts) - power wire is on that pin, not D6.");
+      Serial.println("[therm]   ADOPTED for this session; move the wire or THERM_PWR_PIN.");
+      Serial.flush();
+      return;
+    }
+    pinMode(pin, INPUT);                     // not it - release
+  }
+
+  // Is the sense wire on a different analog pin? Read-only sweep: a
+  // divider node sits mid-scale and FOLLOWS the drive; the peripheral
+  // pins' own pullups sit at the rail and do not.
+  static const uint8_t kAltSense[] = {A1, A2, A3, A4, A5};
+  static const char* const kAltRole[] = {
+      "the button", "MCP9600 SDA", "MCP9600 SCL", "OLED SDA", "OLED SCL"};
+  digitalWrite(thermPwrPin, HIGH);
+  delay(THERM_SETTLE_MS);
+  analogReference(AR_VDD4);
+  uint16_t hi[5];
+  for (int i = 0; i < 5; i++) hi[i] = (uint16_t)analogRead(kAltSense[i]);
+  digitalWrite(thermPwrPin, LOW);
+  delay(THERM_SETTLE_MS);
+  for (int i = 0; i < 5; i++) {
+    const uint16_t lo = (uint16_t)analogRead(kAltSense[i]);
+    if (hi[i] > 200 && hi[i] < 3900 && hi[i] > lo + 800) {
+      Serial.print("[therm]   a divider node is following the drive pin on D");
+      Serial.print(kAltSense[i]);
+      Serial.print(" - that pin belongs to ");
+      Serial.print(kAltRole[i]);
+      Serial.println("! Move the sense wire to A0/D0.");
+      Serial.flush();
+      return;
+    }
+  }
+
+  // Nothing answers anywhere: is A0 even connected to a node? Inject
+  // charge and watch it bleed. A real node (divider legs and/or the cap
+  // to ground) drains the pin in a few ms; a floating pin holds the
+  // charge on its own few pF more or less indefinitely.
+  pinMode(THERM_ADC_PIN, OUTPUT);
+  digitalWrite(THERM_ADC_PIN, HIGH);
+  delay(1);
+  pinMode(THERM_ADC_PIN, INPUT);             // no pull
+  delay(5);
+  const uint16_t held = (uint16_t)analogRead(THERM_ADC_PIN);
+  if (held > 2500) {
+    Serial.print("[therm]   A0 holds injected charge (");
+    Serial.print(held);
+    Serial.println(" counts) - A0 is FLOATING: sense wire not on the node,");
+    Serial.println("[therm]   or the cap is IN SERIES between the node and A0.");
+  } else {
+    Serial.print("[therm]   A0 is loaded (injected charge fell to ");
+    Serial.print(held);
+    Serial.println(" counts) but nothing drives the node - fixed-resistor");
+    Serial.println("[therm]   leg open, or the power wire is not on D6-D10.");
+  }
+  Serial.flush();
 }
 
 // Battery: the XIAO's onboard 1M/510k divider, gated by VBAT_ENABLE
@@ -1309,6 +1445,21 @@ void loop() {
   if (millis() - tTherm >= THERM_MS) {
     tTherm = millis();
     thermC = readThermistorC();
+    // Persistent rail-pegged reads -> run the harness diagnostic, then
+    // re-run every 15 s while the fault lasts (verdicts print each time,
+    // so re-flowing a joint shows up live on serial).
+    static uint8_t  thermNanRun = 0;
+    static uint32_t tThermDiag  = 0;
+    if (!isnan(thermC)) {
+      thermNanRun = 0;
+    } else if (thermNanRun < 255) {
+      thermNanRun++;
+    }
+    if (thermNanRun >= 3 &&
+        (tThermDiag == 0 || millis() - tThermDiag >= 15000)) {
+      tThermDiag = millis();
+      thermDiagnose();
+    }
   }
   if (tBatt == 0 || millis() - tBatt >= BATT_MS) {
     tBatt = millis();

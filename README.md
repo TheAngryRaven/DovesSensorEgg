@@ -123,7 +123,15 @@ error — at DC the ADC draws from the cap, not through the resistor).
 When the divider reads `nan`, serial appends the raw ADC counts and
 which rail they peg: HIGH rail = the NTC leg isn't conducting (open
 joint / thermistor out of circuit), LOW rail = D6's drive isn't reaching
-the divider or A0 isn't on the node.
+the divider or A0 isn't on the node. After three consecutive `nan`
+reads the pod runs a **thermistor harness diagnostic** (repeating every
+15 s while the fault lasts, so a re-flowed joint shows up live): it
+distinguishes an open NTC leg from a node tied to a live rail, probes
+D7–D10 in case the power wire landed on the wrong pin (**and adopts it**
+for the session if found), checks whether a divider node is following
+the drive on one of the peripheral analog pins (sense wire misplaced),
+and finally charge-injects A0 to tell a floating sense wire (or a cap
+soldered in series with A0) from an open fixed-resistor leg.
 
 D6 is driven high only for the ~13 ms around each 1 Hz read — no idle
 drain, no self-heating, nothing left energized in deep sleep. **The cap
