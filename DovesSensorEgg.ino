@@ -937,13 +937,32 @@ void thermDiagnose() {
     }
   }
 
-  // Nothing answers anywhere: is A0 even connected to a node? Inject
-  // charge and watch it bleed. A real node (divider legs and/or the cap
-  // to ground) drains the pin in a few ms; a floating pin holds the
-  // charge on its own few pF more or less indefinitely.
+  // Is the node SHORTED to ground? Drive A0 itself high and read while
+  // still driving: a normal node follows the pin driver (~full scale
+  // against the divider's k-ohms); a dead short holds it near zero.
+  // The classic cause on this bench: a THERMOCOUPLE plugged in where
+  // the NTC belongs — a TC is a few OHMS end to end.
   pinMode(THERM_ADC_PIN, OUTPUT);
   digitalWrite(THERM_ADC_PIN, HIGH);
   delay(1);
+  analogReference(AR_VDD4);
+  const uint16_t driven = (uint16_t)analogRead(THERM_ADC_PIN);
+  if (driven < 1000) {
+    pinMode(THERM_ADC_PIN, INPUT);
+    Serial.print("[therm]   node SHORTED to ground (");
+    Serial.print(driven);
+    Serial.println(" counts while driven high) - shorted leads, or is this");
+    Serial.println("[therm]   probe actually a THERMOCOUPLE? A TC is a few ohms;");
+    Serial.println("[therm]   this input needs an NTC thermistor.");
+    Serial.flush();
+    return;
+  }
+
+  // Not shorted: is A0 even connected to a node? The drive above just
+  // charged it - release and watch the charge bleed. A real node
+  // (divider legs and/or the cap to ground) drains the pin in a few
+  // ms; a floating pin holds the charge on its own few pF more or
+  // less indefinitely.
   pinMode(THERM_ADC_PIN, INPUT);             // no pull
   delay(5);
   const uint16_t held = (uint16_t)analogRead(THERM_ADC_PIN);
@@ -1582,6 +1601,14 @@ void loop() {
     Serial.print("    TH ");
     Serial.print(thermC, 1);
     Serial.print(" C");
+    if (!isnan(thermC)) {
+      // Measured NTC resistance: the ground truth that identifies the
+      // part. A "100k" input reading R=10k at ambient is a 10k probe;
+      // R=1.9k means the fixed leg is not the value the math assumes.
+      Serial.print(" (R=");
+      Serial.print(thermistor::countsToResistance(thermRaw) / 1000.0f, 1);
+      Serial.print("k)");
+    }
     if (isnan(thermC)) {
       // Rail-pegged divider: say WHICH rail, because in this topology
       // (fixed leg on D6, NTC to GND) they mean different faults.
