@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <limits>
 
+#include "nan_bits.h"
 #include "pw_adv_encode.h"
 
 using namespace pw_adv;
@@ -46,6 +47,19 @@ TEST_CASE("pw_adv - unknown battery and invalid thermistor wire bytes") {
     CHECK(out[11] == 0xFF);              // battery unknown
     CHECK(out[14] == 0x00);              // 0x8000 sentinel, little-endian
     CHECK(out[15] == 0x80);
+}
+
+TEST_CASE("nan_bits - bit-level NaN check (the -Ofast-proof one)") {
+    CHECK(isNanF(std::numeric_limits<float>::quiet_NaN()));
+    CHECK(isNanF(std::numeric_limits<float>::signaling_NaN()));
+    CHECK(isNanF(-std::numeric_limits<float>::quiet_NaN()));
+    CHECK(!isNanF(0.0f));
+    CHECK(!isNanF(-0.0f));
+    CHECK(!isNanF(650.0f));
+    CHECK(!isNanF(std::numeric_limits<float>::infinity()));
+    CHECK(!isNanF(-std::numeric_limits<float>::infinity()));
+    CHECK(!isNanF(std::numeric_limits<float>::max()));
+    CHECK(!isNanF(std::numeric_limits<float>::denorm_min()));
 }
 
 TEST_CASE("pw_adv - invalid readings emit the 0x8000 sentinel, never a cast") {

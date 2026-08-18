@@ -10,7 +10,8 @@ Wireless sensor backpack for
 [DovesDataLogger](https://github.com/TheAngryRaven/DovesDataLogger).
 
 A Seeed XIAO nRF52840 + Adafruit MCP9600 thermocouple amp reads a K-type
-EGT probe (plus an aux 100k NTC thermistor and its own battery level) and
+EGT probe (plus an aux NTC thermistor for intake air and its own
+battery level) and
 **broadcasts** the readings in BLE advertising packets — protocol
 `PW-ADV-2`. The egg is a pure broadcaster: it never accepts a
 connection, so the logger receives it with a passive scan that cannot
@@ -104,8 +105,10 @@ left column, top to bottom          right column, top to bottom
 ```
 
 **Thermistor divider** (aux temperature, payload bytes 14–15): 100k
-fixed resistor from **D6** to the sense node, 100k NTC from the sense
-node to **GND**, sense node to **A0/D0**, and a **10 nF ceramic
+fixed resistor from **D6** to the sense node, the NTC from the sense
+node to **GND** (currently the sealed 10k metal probe for intake-air
+duty — profiles and the deliberate 10k-against-100k "lazy divider"
+math live in `thermistor.h`), sense node to **A0/D0**, and a **10 nF ceramic
 smoothing cap from the sense node to GND** (in parallel with the NTC —
 NOT in series between the node and A0, which DC-blocks the pin and pegs
 the reading at the LOW rail) — placed at the XIAO end of the leads, not
@@ -143,7 +146,17 @@ the drive on one of the peripheral analog pins (sense wire misplaced),
 and finally charge-injects A0 to tell a floating sense wire (or a cap
 soldered in series with A0) from an open fixed-resistor leg.
 
-D6 is driven high only for the ~13 ms around each 1 Hz read — no idle
+Thermistor reads are filtered twice: an 8-sample burst per read with
+min and max discarded (one EMI spike cannot move the result), then a
+cross-tick exponential average with a ~4 s time constant
+(`THERM_EMA_ALPHA`) — physically free for intake air, which cannot
+change faster than seconds. A fault resets the filter, so an unplug
+still hits the wire sentinel within one tick. The smoothing cap is
+still required hardware — the filter cleans up quantization and
+sampling noise, the cap is what keeps ignition EMI out of the ADC's
+acquisition window in the first place.
+
+D6 is driven high only for the ~14 ms around each 1 Hz read — no idle
 drain, no self-heating, nothing left energized in deep sleep. **The cap
 value and `THERM_SETTLE_MS` are coupled**: the node charges through the
 divider each pulse (worst-case τ = 100 kΩ × C, cold NTC), and the settle
@@ -282,6 +295,23 @@ package. The Adafruit MCP9600 library is no longer used — the sensor is
 driven by the in-repo `mcp9600.{h,cpp}` register driver over the
 timeout-capable `soft_i2c` bus (register codecs host-tested in
 `mcp9600_regs`).
+
+## The -Ofast rule
+
+The Seeed nRF52 platform compiles sketches with **`-Ofast`**, which
+includes `-ffinite-math-only`: **`isnan()` is constant-folded to
+`false`** and NaN comparisons are optimized on the assumption NaN can't
+exist. Field-confirmed 2026-07-27 — every `isnan()`-gated branch in
+device code was silently compiled out (the thermistor filter never
+seeded and manufactured a permanent `nan`; the `nan` serial forensics
+never printed in *any* build; the payload's NaN→`0x8000` sentinel guard
+could have cast garbage onto the wire). Host builds don't use `-Ofast`,
+so the test suite was blind to all of it.
+
+Device-compiled code therefore uses `isNanF()` from `nan_bits.h` — a
+bit-pattern check the optimizer cannot fold — and never compares a
+possibly-NaN float before checking it. Plain `isnan()` is allowed in
+host-only code.
 
 ## CI & tests
 
