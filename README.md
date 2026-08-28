@@ -14,12 +14,19 @@ Wireless sensor backpack for
 
 A Seeed XIAO nRF52840 + Adafruit MCP9600 thermocouple amp reads a K-type
 EGT probe (plus an aux NTC thermistor for intake air and its own
-battery level) and
-**broadcasts** the readings in BLE advertising packets — protocol
-`PW-ADV-2`. The egg is a pure broadcaster: it never accepts a
-connection, so the logger receives it with a passive scan that cannot
-interfere with the logger's Insta360 camera link. A small SSD1306 OLED
-shows live temps for bench debugging.
+battery level) and **broadcasts** the readings in BLE advertising
+packets — protocol `PW-ADV-2` — which the logger receives with a
+passive scan that cannot interfere with its Insta360 camera link. Since
+phase 1 of the [PerchWerks Sensor Service](docs/ROADMAP.md) migration
+the egg is also **connectable**: a connection currently serves the
+standard GATT mirrors only — Device Information; Battery Service when a
+pack is present at boot; Environmental Sensing temperature for the
+intake-air thermistor and cold junction (never the EGT, which overflows
+the standard characteristic — see
+[docs/PW_SENSOR_SERVICE.md](docs/PW_SENSOR_SERVICE.md) §7). While a
+link is up the beacon pauses; it resumes on disconnect, so an unclaimed
+egg broadcasts exactly as before. A small SSD1306 OLED shows live temps
+for bench debugging (a `LINK` badge marks a live connection).
 
 ## Documentation
 

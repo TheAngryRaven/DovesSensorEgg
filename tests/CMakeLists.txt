@@ -13,10 +13,12 @@ set(EGG_DIR ${CMAKE_CURRENT_SOURCE_DIR}/..)
 add_executable(sensoregg_tests
   test_main.cpp
   pw_adv_encode_test.cpp
+  pw_gatt_encode_test.cpp
   mcp9600_regs_test.cpp
   thermistor_test.cpp
   battery_test.cpp
   ${EGG_DIR}/pw_adv_encode.cpp
+  ${EGG_DIR}/pw_gatt_encode.cpp
   ${EGG_DIR}/mcp9600_regs.cpp
   ${EGG_DIR}/thermistor.cpp
   ${EGG_DIR}/battery.cpp
