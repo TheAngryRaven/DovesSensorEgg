@@ -1,10 +1,13 @@
 # DovesSensorEgg
 
-> **Status: experimental.** This is a proof-of-concept — the "wireless
-> sensor pod" idea is promising as a unit, but it needs more work and
-> conceptualization before being taken further. CI is deliberately basic
-> (a compile check and a couple of unit tests, below); no release
-> pipeline or auto-updating manifests until the concept firms up.
+> **Status: reference implementation, evolving.** This repo is becoming
+> the reference pod of the **PerchWerks Sensor Service** — a
+> standardized, third-party-buildable wireless sensor pod system. The
+> firmware currently shipping is the broadcast-only PW-ADV-2 stage; the
+> system design lives in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+> and the migration plan in [docs/ROADMAP.md](docs/ROADMAP.md). CI is
+> deliberately basic (a compile check and unit tests, below); a release
+> pipeline comes later in the roadmap.
 
 Wireless sensor backpack for
 [DovesDataLogger](https://github.com/TheAngryRaven/DovesDataLogger).
@@ -18,45 +21,35 @@ connection, so the logger receives it with a passive scan that cannot
 interfere with the logger's Insta360 camera link. A small SSD1306 OLED
 shows live temps for bench debugging.
 
+## Documentation
+
+| Doc | What it is |
+|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System design + rationale, decision ledger |
+| [docs/PW_SENSOR_SERVICE.md](docs/PW_SENSOR_SERVICE.md) | The GATT service spec (normative) |
+| [docs/PW_CHANNEL_SCHEMA.md](docs/PW_CHANNEL_SCHEMA.md) | Transport-neutral channel schema — the universal protocol |
+| [docs/PW_ADV_2.md](docs/PW_ADV_2.md) | The shipped broadcast beacon spec (normative) |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Migration phases + parking lot |
+
 ## Protocol — PW-ADV-2
 
-> **Logger compatibility:** the DovesDataLogger's parser is still on v1 —
-> it requires version `0x01` exactly and truncates received payloads at
-> 14 bytes, so it silently **drops** v2 frames until its parser round
-> lands. Bench-verify a v2 egg with nRF Connect (16-byte mfg data
-> starting `FF FF 50 57 02`).
+Full spec: **[docs/PW_ADV_2.md](docs/PW_ADV_2.md)** — byte table, radio
+parameters, versioning and conformance anchors live there (single home;
+moved out of this README).
 
-Manufacturer Specific Data, 16 bytes, advertised under the name `PWEGT`
-(multi-byte fields little-endian). Advertising interval is **111.875 ms
-— deliberately not 100 ms**: the logger scans on a 100 ms cycle, and
-equal periods phase-lock so the egg can park in the scanner's deaf zone
-for seconds; an off-100 interval sweeps the phase instead. The payload
-(and sequence counter) refresh every 250 ms — still far inside a K-type
-probe's 0.5–3 s thermal time constant. The company ID is *inside* the
-array — Bluefruit passes the buffer through raw on both sides:
+Summary: 16-byte Manufacturer Specific Data under the name `PWEGT`,
+advertised at 111.875 ms (deliberately off the logger's 100 ms scan
+cycle so the beacon can't park in the scanner's deaf zone), payload and
+sequence counter refreshed every 250 ms. Temperatures ride as int16
+deci-°C with `0x8000` as the invalid sentinel (never a NaN cast — UB),
+plus battery percent, raw MCP9600 STATUS, and flags for the pairing
+window and TC fault. The logger's parser is still v1-gated and silently
+**drops** v2 frames until its parser round lands — bench-verify a v2
+egg with nRF Connect (16-byte mfg data starting `FF FF 50 57 02`).
 
-v2 appends to v1 — bytes 0–13 keep their exact v1 offsets:
-
-| Byte | Field |
-|---|---|
-| 0–1 | Company ID `FF FF` (SIG test/internal) |
-| 2–3 | Magic `50 57` (`PW`) |
-| 4 | Protocol version `02` |
-| 5 | Flags: bit0 = pairing window, bit1 = TC fault |
-| 6–7 | EGT, int16 deci-°C (`0x8000` = invalid) |
-| 8–9 | Cold junction, int16 deci-°C (`0x8000` = invalid) |
-| 10 | Raw MCP9600 STATUS (reg 0x04; bit 4 = open probe) |
-| 11 | Battery % 0–100 (`0xFF` = unknown / no pack) |
-| 12–13 | Sequence counter (wraps) |
-| 14–15 | Aux thermistor, int16 deci-°C (`0x8000` = invalid) |
-
-An open/shorted thermistor divider is signalled by the `0x8000` sentinel
-alone — no flag bit. Budget: 3 (flags AD) + 18 (mfg AD) + 7 (name) =
-28 of the 31-byte legacy advertising payload.
-
-NaN / out-of-range readings are sent as the `0x8000` sentinel — never
-cast to int16 (UB). The logger treats readings older than 1 s as gone
-(logs `nan`) so a dropout is never a held flat line.
+Under the [PerchWerks Sensor Service](docs/PW_SENSOR_SERVICE.md)
+migration this beacon survives byte-identical as the pre-pairing
+advertisement; connections carry everything else.
 
 ## Hardware
 
@@ -321,7 +314,7 @@ DovesDataLogger repo's, minus everything release-related):
 - **compile-sketch** — compiles the sketch for the Seeed XIAO nRF52840
   (the same board the datalogger uses) with the real libraries.
 - **unit-tests** — host-built doctest suite over the extracted pure
-  logic. `pw_adv_encode.{h,cpp}` builds the PW-ADV-1 payload, and its
+  logic. `pw_adv_encode.{h,cpp}` builds the PW-ADV-2 payload, and its
   golden-byte test uses the **same fixture bytes** as the logger repo's
   `sensoregg_protocol` parser test — the two tests together pin the wire
   contract from both ends. Run locally:
