@@ -319,7 +319,12 @@ Two deliberately-basic GitHub Actions workflows (same shapes as the
 DovesDataLogger repo's, minus everything release-related):
 
 - **compile-sketch** — compiles the sketch for the Seeed XIAO nRF52840
-  (the same board the datalogger uses) with the real libraries.
+  (the same board the datalogger uses) with the real libraries, and a
+  second job packages a **flashable UF2** uploaded as a workflow
+  artifact: download `DovesSensorEgg-uf2` from the run's Artifacts,
+  double-tap reset on the pod to get the UF2 bootloader drive, and copy
+  the `.uf2` over — no IDE or DFU utility needed. Locally the same
+  build is `tools/build-uf2.sh` (see `tools/README.md`).
 - **unit-tests** — host-built doctest suite over the extracted pure
   logic. `pw_adv_encode.{h,cpp}` builds the PW-ADV-2 payload, and its
   golden-byte test uses the **same fixture bytes** as the logger repo's
