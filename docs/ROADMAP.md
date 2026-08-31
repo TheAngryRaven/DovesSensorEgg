@@ -23,12 +23,12 @@
 4. All existing reliability layers (watchdog, safe mode, harness
    diagnostics, display deadman) survive untouched.
 
-## Phase 0 — specs and docs (this branch) ✔
+## Phase 0 — specs and docs ✔ (merged)
 
 The five documents in `docs/`, README rework, merged-branch cleanup.
 No firmware changes.
 
-## Phase 1 — connectable shell + standard mirrors
+## Phase 1 — connectable shell + standard mirrors (this branch)
 
 Make the pod connectable without changing what it broadcasts.
 

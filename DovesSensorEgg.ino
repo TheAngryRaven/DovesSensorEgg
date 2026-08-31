@@ -1,15 +1,22 @@
 /* ==========================================================================
-   DovesSensorEgg - wireless EGT pod (PW-ADV-2 broadcaster)
+   DovesSensorEgg - PerchWerks EGT pod (PW-ADV-2 beacon + GATT phase 1)
    XIAO nRF52840 + Adafruit MCP9600 + I2C OLED + button
 
    Boot -> bird splash -> scan I2C -> BLE up (MAC shown) -> live temp on
    screen + serial + BLE advertising.
 
-   BLE: pure BROADCASTER. EGT + cold junction + aux thermistor + battery
-   are packed into a 16-byte Manufacturer Specific Data AD structure
-   ("PW-ADV-2") and advertised at ~10 Hz under the name "PWEGT". The egg
-   never accepts a connection; the DovesDataLogger receives the
-   broadcasts with a passive scan. nRF Connect on a phone doubles as a
+   BLE: the pod advertises the PW-ADV-2 beacon (16-byte Manufacturer
+   Specific Data under the name "PWEGT", docs/PW_ADV_2.md) and — since
+   the PerchWerks Sensor Service migration began (docs/ROADMAP.md,
+   phase 1) — is CONNECTABLE. Connections currently serve the standard
+   mirrors only: Device Information; Battery Service when a pack is
+   present at boot; Environmental Sensing temperature for the aux
+   thermistor and cold junction (NEVER the EGT — 0x2A6E is sint16
+   centi-degC, ceiling 327.67 C). The PerchWerks GATT service itself
+   lands in phases 2-3. While a link is up the beacon pauses (the
+   payload rebuild tick is gated); it resumes on disconnect. Unclaimed,
+   the pod broadcasts exactly as before and the DovesDataLogger's
+   passive scan is unaffected. nRF Connect on a phone doubles as a
    live hex debugger (mfg data starts FF FF 50 57, bytes 12-13
    increment). COMPAT: the logger's parser still requires version 0x01
    and truncates at 14 bytes — until its v2 round lands, the logger
@@ -64,6 +71,7 @@
 
 #include "images.h"          // boot splash (the bird, from DovesDataLogger)
 #include "pw_adv_encode.h"   // PW-ADV-2 payload builder (host-tested)
+#include "pw_gatt_encode.h"  // GATT-side codecs (host-tested): ESS mirror
 #include "nan_bits.h"        // isNanF: NaN check that survives -Ofast
 #include "thermistor.h"      // aux NTC codec (host-tested)
 #include "battery.h"         // XIAO battery divider codec (host-tested)
@@ -313,6 +321,25 @@ uint16_t advSeq    = 0;
 uint32_t pairUntil = 0;       // millis deadline; 0 = pairing window closed
 bool     advOK     = false;   // last Advertising.start() result
 uint32_t advFails  = 0;       // consecutive-rebuild failure count (debug)
+volatile bool bleConnected = false;  // set from the conn callbacks (BLE task)
+
+// ---- GATT (phase 1: standard mirrors only — docs/ROADMAP.md) --------------
+// The PerchWerks Sensor Service (docs/PW_SENSOR_SERVICE.md) lands in
+// phases 2-3; until then a connection serves generic apps only.
+#define PW_FW_REV "1.0"       // DIS Firmware Revision; becomes the
+                              // descriptor's fw_major.fw_minor in phase 2
+BLEDis bledis;                // Device Information: always exposed
+BLEBas blebas;                // Battery Service: ONLY if a pack is present at
+bool   basActive = false;     // boot — 0x2A19 has no "unknown" encoding and a
+                              // service can't be unregistered, so a USB-only
+                              // bench pod must not carry a BAS forced to lie
+BLEService        essSvc(0x181A);   // Environmental Sensing
+BLECharacteristic essIat(0x2A6E);   // Temperature: aux thermistor (intake air)
+BLECharacteristic essCj (0x2A6E);   // Temperature: MCP9600 cold junction
+// No ESS characteristic for the EGT, deliberately: 0x2A6E is sint16
+// centi-degC (ceiling 327.67 C) and there is no standard high-temp
+// characteristic — a generic app would show a clamped lie. EGT rides the
+// beacon today and the PerchWerks Sample characteristic from phase 3.
 
 // c2f() lives in pw_adv_encode (host-tested) — used by the debug screen.
 using pw_adv::c2f;
@@ -511,6 +538,10 @@ bool enterDeepSleep() {
   }
 
   Serial.println("deep sleep - hold button 5 s to wake");
+  // Stay silent on the way down: no auto-restart racing the stop, and a
+  // live central gets a clean disconnect instead of a supervision timeout.
+  Bluefruit.Advertising.restartOnDisconnect(false);
+  if (Bluefruit.connected()) Bluefruit.disconnect(Bluefruit.connHandle());
   Bluefruit.Advertising.stop();
   mcpShutdown(mcp);                        // MCP9600 shutdown mode (~uA)
   digitalWrite(thermPwrPin, LOW);          // thermistor divider dead
@@ -1074,7 +1105,14 @@ uint8_t btnEvent() {
 // until the next tick, and a RUN of failures is the one egg-side fault
 // that looks exactly like a dead egg to the logger - so it's surfaced on
 // the debug screen ("ADV!") and serial instead of being swallowed.
+//
+// GATED ON CONNECTION: with one peripheral link the SoftDevice cannot
+// run connectable advertising while that link is up — start() would just
+// fail every tick (and a claimed pod SHOULD go quiet: spec section 3).
+// The beacon (and advSeq) freeze for the duration; the disconnect
+// callback plus the next tick bring it back.
 void updateAdvertising(float egtC, float cjC, uint8_t st) {
+  if (Bluefruit.connected()) return;
   uint8_t payload[pw_adv::kPayloadLen];
   advSeq++;                                  // one increment per adv update
   pw_adv::buildPayload(payload, egtC, cjC, st,
@@ -1093,18 +1131,76 @@ void updateAdvertising(float egtC, float cjC, uint8_t st) {
   }
 }
 
+// Connection callbacks run in Bluefruit's callback task (not an ISR).
+// They only flip the flag and narrate; the 250 ms payload tick and
+// restartOnDisconnect() do the actual advertising choreography.
+void bleConnectCb(uint16_t connHandle) {
+  (void)connHandle;
+  bleConnected = true;
+  Serial.println("BLE link up - beacon paused while connected");
+}
+
+void bleDisconnectCb(uint16_t connHandle, uint8_t reason) {
+  (void)connHandle;
+  bleConnected = false;
+  Serial.print("BLE link down (reason 0x");
+  Serial.print(reason, HEX);
+  Serial.println(") - beacon resumes");
+}
+
 // -------------------------------------------------- BLE bringup
 void bleSetup() {
   Bluefruit.begin();
   Bluefruit.setTxPower(4);
   Bluefruit.setName("PWEGT");
 
-  // Nothing ever connects to the egg. If this line fails to compile on
-  // the installed core version, delete it and move on.
-  Bluefruit.Advertising.setType(BLE_GAP_ADV_TYPE_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED);
+  // Connectable (Bluefruit's default advertising type) since phase 1 of
+  // the PerchWerks migration — docs/ROADMAP.md. The AD payload budget is
+  // identical to the old nonconnectable type, so the beacon bytes are
+  // untouched (the golden test still pins them).
+  Bluefruit.Periph.setConnectCallback(bleConnectCb);
+  Bluefruit.Periph.setDisconnectCallback(bleDisconnectCb);
+  // SoftDevice-side instant resume with the last-set payload; the next
+  // 250 ms tick then rebuilds it fresh.
+  Bluefruit.Advertising.restartOnDisconnect(true);
 
   Bluefruit.Advertising.setInterval(ADV_INTERVAL_UNITS, ADV_INTERVAL_UNITS);
   Bluefruit.Advertising.setFastTimeout(0);      // never drop to the slow interval
+
+  // ---- standard GATT mirrors (docs/PW_SENSOR_SERVICE.md section 7) ----
+  // Registered before advertising ever starts (the first payload tick).
+  bledis.setManufacturer("PerchWerks");
+  bledis.setModel("DovesSensorEgg");
+  bledis.setFirmwareRev(PW_FW_REV);
+  bledis.begin();
+
+  // BAS only with a real pack (see the globals note). One read now: the
+  // decision has to happen before the service table freezes.
+  batteryPct = readBatteryPct();
+  if (batteryPct != pw_adv::kBatteryUnknown) {
+    blebas.begin();
+    blebas.write(batteryPct);
+    basActive = true;
+  } else {
+    Serial.println("no battery pack - Battery Service not exposed");
+  }
+
+  // Two Temperature instances under one ESS service, told apart by their
+  // user-description descriptors. Values refresh on the sensor ticks in
+  // loop(); until first refresh they read as 0x8000 ("not known").
+  essSvc.begin();
+  essIat.setProperties(CHR_PROPS_READ);
+  essIat.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  essIat.setFixedLen(2);
+  essIat.setUserDescriptor("IAT");
+  essIat.begin();
+  essIat.write16((uint16_t)pw_gatt::kEssUnknown);
+  essCj.setProperties(CHR_PROPS_READ);
+  essCj.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  essCj.setFixedLen(2);
+  essCj.setUserDescriptor("CJ");
+  essCj.begin();
+  essCj.write16((uint16_t)pw_gatt::kEssUnknown);
 
   // Print our MAC (human order, MSB first) so it can be copied into the
   // logger's SENSOREGG_MAC #define for strict pairing.
@@ -1237,8 +1333,12 @@ void drawScreen(float egtC, float cjC, uint8_t st) {
   // Transient states borrow the bottom-right corner (normally blank).
   // SAFE outranks the others: it says the pod broke a boot loop to get
   // here, which the user needs to see for longer than a pairing window.
+  // LINK outranks ADV!/PAIR: while connected the beacon is paused on
+  // purpose, so advertising state is stale by design.
   if (safeMode) {
     oled.setCursor(OLED_W - 24, 56); oled.print("SAFE");
+  } else if (bleConnected) {
+    oled.setCursor(OLED_W - 24, 56); oled.print("LINK");
   } else if (!advOK) {
     oled.setCursor(OLED_W - 24, 56); oled.print("ADV!");
   } else if (millis() < pairUntil) {
@@ -1501,6 +1601,7 @@ void loop() {
   if (millis() - tTherm >= THERM_MS) {
     tTherm = millis();
     thermC = readThermistorC();
+    essIat.write16((uint16_t)pw_gatt::encodeCentiC(thermC));  // ESS mirror
     // Persistent rail-pegged reads -> run the harness diagnostic, then
     // re-run every 15 s while the fault lasts (verdicts print each time,
     // so re-flowing a joint shows up live on serial).
@@ -1520,6 +1621,12 @@ void loop() {
   if (tBatt == 0 || millis() - tBatt >= BATT_MS) {
     tBatt = millis();
     batteryPct = readBatteryPct();
+    // BAS mirror: only registered when a pack was present at boot. A
+    // read that comes back unknown mid-session (pack pulled) holds the
+    // last level - 0x2A19 has no way to say "unknown".
+    if (basActive && batteryPct != pw_adv::kBatteryUnknown) {
+      blebas.write(batteryPct);
+    }
   }
   static float    egtC = NAN, cjC = NAN;
   static uint8_t  st = 0;
@@ -1561,6 +1668,7 @@ void loop() {
     egtC  = mcpReadHotC(mcp);    // NaN on any bus fault — never stale data
     cjC   = mcpReadColdC(mcp);
     st    = mcpReadStatus(mcp);  // 0xFF on fault (sets the TC-fault flag)
+    essCj.write16((uint16_t)pw_gatt::encodeCentiC(cjC));  // ESS mirror
     nRead++;
 
     // Runtime recovery: the soft bus's timeouts turn a wedge into an error

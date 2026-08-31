@@ -14,12 +14,19 @@ Wireless sensor backpack for
 
 A Seeed XIAO nRF52840 + Adafruit MCP9600 thermocouple amp reads a K-type
 EGT probe (plus an aux NTC thermistor for intake air and its own
-battery level) and
-**broadcasts** the readings in BLE advertising packets — protocol
-`PW-ADV-2`. The egg is a pure broadcaster: it never accepts a
-connection, so the logger receives it with a passive scan that cannot
-interfere with the logger's Insta360 camera link. A small SSD1306 OLED
-shows live temps for bench debugging.
+battery level) and **broadcasts** the readings in BLE advertising
+packets — protocol `PW-ADV-2` — which the logger receives with a
+passive scan that cannot interfere with its Insta360 camera link. Since
+phase 1 of the [PerchWerks Sensor Service](docs/ROADMAP.md) migration
+the egg is also **connectable**: a connection currently serves the
+standard GATT mirrors only — Device Information; Battery Service when a
+pack is present at boot; Environmental Sensing temperature for the
+intake-air thermistor and cold junction (never the EGT, which overflows
+the standard characteristic — see
+[docs/PW_SENSOR_SERVICE.md](docs/PW_SENSOR_SERVICE.md) §7). While a
+link is up the beacon pauses; it resumes on disconnect, so an unclaimed
+egg broadcasts exactly as before. A small SSD1306 OLED shows live temps
+for bench debugging (a `LINK` badge marks a live connection).
 
 ## Documentation
 
@@ -43,9 +50,9 @@ cycle so the beacon can't park in the scanner's deaf zone), payload and
 sequence counter refreshed every 250 ms. Temperatures ride as int16
 deci-°C with `0x8000` as the invalid sentinel (never a NaN cast — UB),
 plus battery percent, raw MCP9600 STATUS, and flags for the pairing
-window and TC fault. The logger's parser is still v1-gated and silently
-**drops** v2 frames until its parser round lands — bench-verify a v2
-egg with nRF Connect (16-byte mfg data starting `FF FF 50 57 02`).
+window and TC fault. The logger's v2 parser round has **landed**
+(DovesDataLogger BETA accepts v1 and v2); nRF Connect remains a handy
+neutral bench check (16-byte mfg data starting `FF FF 50 57 02`).
 
 Under the [PerchWerks Sensor Service](docs/PW_SENSOR_SERVICE.md)
 migration this beacon survives byte-identical as the pre-pairing
@@ -312,7 +319,12 @@ Two deliberately-basic GitHub Actions workflows (same shapes as the
 DovesDataLogger repo's, minus everything release-related):
 
 - **compile-sketch** — compiles the sketch for the Seeed XIAO nRF52840
-  (the same board the datalogger uses) with the real libraries.
+  (the same board the datalogger uses) with the real libraries, and a
+  second job packages a **flashable UF2** uploaded as a workflow
+  artifact: download `DovesSensorEgg-uf2` from the run's Artifacts,
+  double-tap reset on the pod to get the UF2 bootloader drive, and copy
+  the `.uf2` over — no IDE or DFU utility needed. Locally the same
+  build is `tools/build-uf2.sh` (see `tools/README.md`).
 - **unit-tests** — host-built doctest suite over the extracted pure
   logic. `pw_adv_encode.{h,cpp}` builds the PW-ADV-2 payload, and its
   golden-byte test uses the **same fixture bytes** as the logger repo's

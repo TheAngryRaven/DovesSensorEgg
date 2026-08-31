@@ -17,13 +17,14 @@
 > connectable. Advertising stops while connected and resumes on
 > disconnect.
 
-## 1. Logger compatibility (current reality)
+## 1. Logger compatibility
 
-The DovesDataLogger's parser is still on v1 — it requires version
-`0x01` exactly and truncates received payloads at 14 bytes, so it
-silently **drops** v2 frames until its parser round lands. Bench-verify
-a v2 egg with nRF Connect (16-byte manufacturer data starting
-`FF FF 50 57 02`).
+The DovesDataLogger's v2 round has **landed** (BETA channel): its
+`sensoregg_protocol` parser accepts versions `0x01` and `0x02` and
+captures the full 16-byte payload (the old RX path truncated at 14
+bytes and dropped v2). Both repos pin the same golden fixture bytes —
+see §6. nRF Connect remains the neutral bench check (16-byte
+manufacturer data starting `FF FF 50 57 02`).
 
 ## 2. Radio parameters
 
