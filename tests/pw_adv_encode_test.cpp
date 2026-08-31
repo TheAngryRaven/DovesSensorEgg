@@ -10,11 +10,10 @@
 using namespace pw_adv;
 
 // Golden PW-ADV-2 frame. The DovesDataLogger repo's sensoregg_protocol
-// parser fixture must adopt these SAME bytes when its v2 round lands
-// (as of this commit the logger still pins the 14-byte v1 frame and
-// drops v2 — see the header note in pw_adv_encode.h). This is the wire
-// contract: if either side changes the layout, BOTH golden tests must
-// change with it — deliberately.
+// parser fixture pins these SAME bytes (its v2 round landed on the
+// logger's BETA channel). This is the wire contract: if either side
+// changes the layout, BOTH golden tests must change with it —
+// deliberately.
 //
 //   FF FF        company ID (SIG test/internal, inside the array)
 //   50 57        magic 'P' 'W'

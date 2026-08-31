@@ -50,9 +50,9 @@ cycle so the beacon can't park in the scanner's deaf zone), payload and
 sequence counter refreshed every 250 ms. Temperatures ride as int16
 deci-°C with `0x8000` as the invalid sentinel (never a NaN cast — UB),
 plus battery percent, raw MCP9600 STATUS, and flags for the pairing
-window and TC fault. The logger's parser is still v1-gated and silently
-**drops** v2 frames until its parser round lands — bench-verify a v2
-egg with nRF Connect (16-byte mfg data starting `FF FF 50 57 02`).
+window and TC fault. The logger's v2 parser round has **landed**
+(DovesDataLogger BETA accepts v1 and v2); nRF Connect remains a handy
+neutral bench check (16-byte mfg data starting `FF FF 50 57 02`).
 
 Under the [PerchWerks Sensor Service](docs/PW_SENSOR_SERVICE.md)
 migration this beacon survives byte-identical as the pre-pairing

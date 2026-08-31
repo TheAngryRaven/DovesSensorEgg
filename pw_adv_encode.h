@@ -10,11 +10,12 @@
 // encode == decode across the two repos.
 //
 // v2 (2026-07-26) appends to v1 — bytes 0-13 keep their exact v1
-// offsets, so the logger's v1 field decoding carries over unchanged
-// once its version gate accepts 0x02. NOTE: until that logger round
-// lands, the logger DROPS v2 frames (its parser requires version ==
-// 0x01 and its RX buffer truncates at 14 bytes). Verify v2 eggs with
-// nRF Connect in the meantime.
+// offsets, so the logger's v1 field decoding carried over unchanged
+// when its version gate learned 0x02. That logger round has LANDED
+// (DovesDataLogger BETA: sensoregg_protocol accepts 0x01 and 0x02 and
+// captures the full 16 bytes — the old RX path truncated at 14), so
+// v2 parses end-to-end. nRF Connect stays the neutral bench check for
+// the raw bytes.
 //
 // Layout (little-endian fields; Bluefruit's addManufacturerData()
 // passes the buffer RAW, so bytes 0-1 ARE the company ID):
