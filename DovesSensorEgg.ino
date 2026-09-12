@@ -246,6 +246,15 @@ struct BootScratch {
   uint32_t magic;
   uint8_t  count;      uint8_t countInv;
   uint8_t  stage;      uint8_t stageInv;
+  // PW boot_id (docs/PW_SENSOR_SERVICE.md section 6): the epoch counter
+  // echoed by the Clock characteristic and every Sample frame so the
+  // logger detects a millis() restart. Its own value/inverse pair,
+  // DELIBERATELY outside scratchValid()/scratchWrite(): the boot-loop
+  // breaker's validity must never couple to a telemetry byte, and
+  // scratchWrite() not touching these two is what lets every existing
+  // call site (including the healthy-boot clear) preserve boot_id for
+  // free.
+  uint8_t  bootId;     uint8_t bootIdInv;
 };
 #define SCRATCH_MAGIC 0xB007E663UL
 // The section-name suffix forces NOBITS ('@' comments out the assembler's
@@ -270,6 +279,47 @@ static void scratchWrite(uint8_t count, uint8_t stage) {
   bootScratch.countInv = (uint8_t)~count;
   bootScratch.stage    = stage;
   bootScratch.stageInv = (uint8_t)~stage;
+}
+
+static bool scratchBootIdValid() {
+  return bootScratch.bootId == (uint8_t)~bootScratch.bootIdInv;
+}
+
+static void scratchWriteBootId(uint8_t id) {
+  bootScratch.bootId    = id;
+  bootScratch.bootIdInv = (uint8_t)~id;
+}
+
+// This boot's PW epoch, published by the Clock characteristic and every
+// Sample frame header. Plain RAM copy so BLE-context readers never touch
+// the noinit scratch.
+static uint8_t g_pwBootId = 0;
+
+// One random byte from the nRF52840 RNG peripheral, direct register
+// access — legal exactly where it's used (early setup(), long before
+// Bluefruit.begin() hands the block to the SoftDevice). Bounded wait;
+// falls back to a micros/FICR hash if the peripheral never signals
+// (never observed, but a boot path must not be able to hang here).
+// Used only to seed boot_id on a cold start: the spec's reboot signal
+// is INEQUALITY, not ordering, so any value works.
+static uint8_t hwRandByte() {
+  NRF_RNG->CONFIG = RNG_CONFIG_DERCEN_Msk;  // bias correction on
+  NRF_RNG->EVENTS_VALRDY = 0;
+  NRF_RNG->TASKS_START = 1;
+  uint8_t v = 0;
+  bool got = false;
+  for (uint32_t i = 0; i < 200000; i++) {   // ~ms-scale bound at 64 MHz
+    if (NRF_RNG->EVENTS_VALRDY) {
+      v = (uint8_t)NRF_RNG->VALUE;
+      got = true;
+      break;
+    }
+  }
+  NRF_RNG->TASKS_STOP = 1;
+  if (!got) {
+    v = (uint8_t)(micros() ^ NRF_FICR->DEVICEID[0]);
+  }
+  return v;
 }
 
 static const char* stageName(uint8_t s) {
@@ -323,11 +373,11 @@ bool     advOK     = false;   // last Advertising.start() result
 uint32_t advFails  = 0;       // consecutive-rebuild failure count (debug)
 volatile bool bleConnected = false;  // set from the conn callbacks (BLE task)
 
-// ---- GATT (phase 1: standard mirrors only — docs/ROADMAP.md) --------------
-// The PerchWerks Sensor Service (docs/PW_SENSOR_SERVICE.md) lands in
-// phases 2-3; until then a connection serves generic apps only.
-#define PW_FW_REV "1.0"       // DIS Firmware Revision; becomes the
-                              // descriptor's fw_major.fw_minor in phase 2
+// ---- GATT (phases 1-3 — docs/ROADMAP.md) ----------------------------------
+// Standard mirrors (phase 1) + the PerchWerks Sensor Service (phases
+// 2-3, docs/PW_SENSOR_SERVICE.md). PW_FW_REV / PW_FW_MAJOR / PW_FW_MINOR
+// come from pw_gatt_encode.h — the Descriptor carries the numerics, DIS
+// the derived string, so they can never drift.
 BLEDis bledis;                // Device Information: always exposed
 BLEBas blebas;                // Battery Service: ONLY if a pack is present at
 bool   basActive = false;     // boot — 0x2A19 has no "unknown" encoding and a
@@ -339,7 +389,45 @@ BLECharacteristic essCj (0x2A6E);   // Temperature: MCP9600 cold junction
 // No ESS characteristic for the EGT, deliberately: 0x2A6E is sint16
 // centi-degC (ceiling 327.67 C) and there is no standard high-temp
 // characteristic — a generic app would show a clamped lie. EGT rides the
-// beacon today and the PerchWerks Sample characteristic from phase 3.
+// beacon and the PerchWerks Sample characteristic below.
+
+// PerchWerks Sensor Service (docs/PW_SENSOR_SERVICE.md section 2): one
+// vendor base UUID, 16-bit index in textual octets 2-3. These arrays are
+// LITTLE-ENDIAN — byte [12] is the index low byte, [13] the high byte.
+static const uint8_t kPwSvcUuid[16] = {
+    0xba, 0x99, 0x4a, 0x31, 0x9c, 0xc1, 0xd7, 0x96,
+    0x75, 0x4a, 0x72, 0x4e, 0x57, 0x50, 0x10, 0xe1};  // 0x5057 service
+static const uint8_t kPwDescUuid[16] = {
+    0xba, 0x99, 0x4a, 0x31, 0x9c, 0xc1, 0xd7, 0x96,
+    0x75, 0x4a, 0x72, 0x4e, 0x58, 0x50, 0x10, 0xe1};  // 0x5058 Descriptor
+static const uint8_t kPwSampUuid[16] = {
+    0xba, 0x99, 0x4a, 0x31, 0x9c, 0xc1, 0xd7, 0x96,
+    0x75, 0x4a, 0x72, 0x4e, 0x59, 0x50, 0x10, 0xe1};  // 0x5059 Sample
+static const uint8_t kPwClkUuid[16] = {
+    0xba, 0x99, 0x4a, 0x31, 0x9c, 0xc1, 0xd7, 0x96,
+    0x75, 0x4a, 0x72, 0x4e, 0x5A, 0x50, 0x10, 0xe1};  // 0x505A Clock
+// Brace-init, not parens: BLEService pwSvc(BLEUuid(kPwSvcUuid)) is the
+// most-vexing-parse — the compiler reads it as a function declaration.
+BLEService        pwSvc{BLEUuid(kPwSvcUuid)};
+BLECharacteristic pwDesc{BLEUuid(kPwDescUuid)};
+BLECharacteristic pwSamp{BLEUuid(kPwSampUuid)};
+BLECharacteristic pwClk{BLEUuid(kPwClkUuid)};
+
+// ---- PW sample batching (phase 3, spec section 5) ----
+// Per-channel batch buffers: filled at the source ticks in loop() so
+// base timestamps are acquisition-true, flushed once per loop pass
+// while a subscriber is listening. Cap 8 rides out short radio stalls;
+// steady state is n = 1 frames at each channel's own rate.
+constexpr uint8_t kPwBatchCap = 8;
+struct PwChannelBuf {
+  int16_t  raw[kPwBatchCap];
+  uint8_t  count;        // samples buffered; 0 = empty
+  uint32_t baseMs;       // acquisition time of raw[0]
+  uint16_t intervalMs;   // nominal period — must match the descriptor
+  uint8_t  seq;          // per-channel frame counter — SEPARATE from advSeq
+};
+static PwChannelBuf pwCh[pw_gatt::kEgtPodChannelCount];
+static uint32_t pwNotifyDrops = 0;  // batches abandoned on a full HVN queue
 
 // c2f() lives in pw_adv_encode (host-tested) — used by the debug screen.
 using pw_adv::c2f;
@@ -1148,8 +1236,106 @@ void bleDisconnectCb(uint16_t connHandle, uint8_t reason) {
   Serial.println(") - beacon resumes");
 }
 
+// -------------------------------------------------- PW sample streaming
+// Phase 3 (spec section 5): per-channel batch frames over the Sample
+// characteristic. Capture happens at the source ticks in loop() so the
+// base timestamps are acquisition-true; these two own buffering and
+// delivery. Steady state is n = 1 frames at each channel's own rate —
+// batches only grow across a radio stall.
+
+static bool pwStreamActive() {
+  return bleConnected && pwSamp.notifyEnabled();
+}
+
+// Append one raw sample to a channel's batch. A full buffer drops the
+// OLDEST sample: the base moves one interval forward and one seq is
+// burned, so the client sees an honest discontinuity instead of
+// silently stretched timing.
+static void pwCapture(uint8_t chId, int16_t raw, uint32_t nowMs) {
+  PwChannelBuf& ch = pwCh[chId];
+  if (ch.count == 0) {
+    ch.baseMs = nowMs;
+  } else if (ch.count >= kPwBatchCap) {
+    memmove(&ch.raw[0], &ch.raw[1], (kPwBatchCap - 1) * sizeof(ch.raw[0]));
+    ch.count = kPwBatchCap - 1;
+    ch.baseMs += ch.intervalMs;
+    ch.seq++;  // consumed with nothing sent -> visible gap
+    pwNotifyDrops++;
+  }
+  ch.raw[ch.count++] = raw;
+}
+
+// Ship every channel's pending batch (one notify each), n sized to the
+// live MTU. Called once per loop() pass. A failed notify (HVN queue
+// full during a radio-starved stretch) abandons the batch — the seq gap
+// tells the client — and the next captures rebuild it.
+static void pwFlush() {
+  if (!pwStreamActive()) {
+    // Nothing listening: keep the buffers empty so a new subscriber
+    // starts from a fresh, truthful base timestamp.
+    for (uint8_t i = 0; i < pw_gatt::kEgtPodChannelCount; i++) {
+      pwCh[i].count = 0;
+    }
+    return;
+  }
+  BLEConnection* conn = Bluefruit.Connection(Bluefruit.connHandle());
+  const uint8_t nMax = pw_gatt::maxSamplesForMtu(conn ? conn->getMtu() : 23);
+  if (nMax == 0) return;
+  for (uint8_t i = 0; i < pw_gatt::kEgtPodChannelCount; i++) {
+    PwChannelBuf& ch = pwCh[i];
+    if (ch.count == 0) continue;
+    const uint8_t n = ch.count < nMax ? ch.count : nMax;
+    uint8_t frame[pw_gatt::kSampleHeaderLen + 2 * kPwBatchCap];
+    const size_t len =
+        pw_gatt::buildSampleFrame(frame, sizeof(frame), i, g_pwBootId, ch.seq,
+                                  ch.baseMs, ch.intervalMs, ch.raw, n);
+    ch.seq++;  // one frame number per attempt, sent or not
+    if (len != 0 && pwSamp.notify(frame, (uint16_t)len)) {
+      if (ch.count > n) {
+        memmove(&ch.raw[0], &ch.raw[n], (size_t)(ch.count - n) * sizeof(ch.raw[0]));
+        ch.count = (uint8_t)(ch.count - n);
+        ch.baseMs += (uint32_t)n * ch.intervalMs;
+      } else {
+        ch.count = 0;
+      }
+    } else {
+      pwNotifyDrops++;
+      ch.count = 0;
+    }
+  }
+}
+
+// Clock characteristic read-authorize (spec section 6). Registered with
+// useAdaCallback=false, so this runs in the SoftDevice event task — the
+// value is built INSIDE the ATT transaction and millis() here is the
+// tightest anchor the logger's clock fit can get. For READs Bluefruit
+// sends no reply on our behalf (it does for writes): the transaction
+// stalls until this reply goes out, so the reply is not optional.
+static void pwClockReadAuthCb(uint16_t connHandle, BLECharacteristic* chr,
+                              ble_gatts_evt_read_t* request) {
+  (void)chr;
+  (void)request;  // 6-byte fixed value — the offset is always 0
+  uint8_t buf[pw_gatt::kClockLen];
+  pw_gatt::buildClock(buf, g_pwBootId, millis());
+  ble_gatts_rw_authorize_reply_params_t reply;
+  memset(&reply, 0, sizeof(reply));
+  reply.type = BLE_GATTS_AUTHORIZE_TYPE_READ;
+  reply.params.read.gatt_status = BLE_GATT_STATUS_SUCCESS;
+  reply.params.read.update = 1;  // replace the stored value with buf
+  reply.params.read.offset = 0;
+  reply.params.read.len = sizeof(buf);
+  reply.params.read.p_data = buf;
+  sd_ble_gatts_rw_authorize_reply(connHandle, &reply);
+}
+
 // -------------------------------------------------- BLE bringup
 void bleSetup() {
+  // MTU 247 + HVN queue 4 for the phase-3 sample stream: all four
+  // channels can flush inside one connection event at the 30 s
+  // coincidence without a spurious seq drop. Must run BEFORE begin();
+  // and never call configPrphBandwidth — it silently re-applies its own
+  // preset over this exact call.
+  Bluefruit.configPrphConn(247, BLE_GAP_EVENT_LENGTH_DEFAULT, 4, 1);
   Bluefruit.begin();
   Bluefruit.setTxPower(4);
   Bluefruit.setName("PWEGT");
@@ -1201,6 +1387,49 @@ void bleSetup() {
   essCj.setUserDescriptor("CJ");
   essCj.begin();
   essCj.write16((uint16_t)pw_gatt::kEssUnknown);
+
+  // ---- PerchWerks Sensor Service (phases 2-3, spec sections 2-6) ----
+  pwSvc.begin();
+
+  // Descriptor: the pod's whole self-description, written once at init
+  // and never again (spec section 4 — static from boot to boot-end).
+  // Sized at its true 104 bytes: still bigger than one default-MTU read,
+  // so nRF Connect exercises the standard ATT long-read path; the
+  // attribute table's 4096-byte default on this core holds it easily.
+  pwDesc.setProperties(CHR_PROPS_READ);
+  pwDesc.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  pwDesc.setFixedLen(pw_gatt::kEgtPodDescriptorLen);
+  pwDesc.begin();
+  {
+    uint8_t d[pw_gatt::kEgtPodDescriptorLen];
+    pw_gatt::buildDescriptor(d, sizeof(d), pw_gatt::kDeviceTypeEgtPod,
+                             PW_FW_MAJOR, PW_FW_MINOR,
+                             pw_gatt::kEgtPodChannels,
+                             pw_gatt::kEgtPodChannelCount);
+    pwDesc.write(d, sizeof(d));
+  }
+
+  // Sample: notify-only batch frames (phase 3). Max length = header +
+  // the full batch; real frames are sized to the live MTU at flush time.
+  pwSamp.setProperties(CHR_PROPS_NOTIFY);
+  pwSamp.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  pwSamp.setMaxLen(pw_gatt::kSampleHeaderLen + 2 * kPwBatchCap);
+  pwSamp.begin();
+
+  // Clock: read-only; the value is built fresh inside each read
+  // transaction by the authorize callback (registered before begin() so
+  // the rd_auth attribute flag lands in the table).
+  pwClk.setProperties(CHR_PROPS_READ);
+  pwClk.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  pwClk.setFixedLen(pw_gatt::kClockLen);
+  pwClk.setReadAuthorizeCallback(pwClockReadAuthCb, false);
+  pwClk.begin();
+
+  // Batch buffers carry the same nominal periods the Descriptor just
+  // advertised — one source of truth, the channel table.
+  for (uint8_t i = 0; i < pw_gatt::kEgtPodChannelCount; i++) {
+    pwCh[i].intervalMs = pw_gatt::kEgtPodChannels[i].samplePeriodMs;
+  }
 
   // Print our MAC (human order, MSB first) so it can be copied into the
   // logger's SENSOREGG_MAC #define for strict pairing.
@@ -1375,6 +1604,17 @@ void setup() {
   const uint8_t regCount = bootCountBump();
   bootCount = (ramCount > regCount) ? ramCount : regCount;
   scratchWrite(ramCount, STAGE_EARLY);
+
+  // PW boot_id (epoch): increment across warm resets; randomize on cold
+  // start (scratch invalid) or a firmware upgrade from the smaller
+  // struct (scratch valid, boot_id pair garbage) — spec-legal either
+  // way, inequality is the signal. scratchWrite() above never touches
+  // the boot_id pair, so reading it after is fine.
+  const uint8_t newBootId = (ramValid && scratchBootIdValid())
+                                ? (uint8_t)(bootScratch.bootId + 1)
+                                : hwRandByte();
+  scratchWriteBootId(newBootId);
+  g_pwBootId = newBootId;
 
   safeMode       = bootCount >= BOOT_SAFE_AFTER;
   displayDeadman = ramValid && prevStage == STAGE_DISPLAY;
@@ -1602,6 +1842,9 @@ void loop() {
     tTherm = millis();
     thermC = readThermistorC();
     essIat.write16((uint16_t)pw_gatt::encodeCentiC(thermC));  // ESS mirror
+    if (pwStreamActive()) {
+      pwCapture(2, pw_adv::encodeDeciC(thermC), tTherm);  // IAT @ 1 s
+    }
     // Persistent rail-pegged reads -> run the harness diagnostic, then
     // re-run every 15 s while the fault lasts (verdicts print each time,
     // so re-flowing a joint shows up live on serial).
@@ -1626,6 +1869,14 @@ void loop() {
     // last level - 0x2A19 has no way to say "unknown".
     if (basActive && batteryPct != pw_adv::kBatteryUnknown) {
       blebas.write(batteryPct);
+    }
+    if (pwStreamActive()) {
+      // Unknown battery rides the schema's sentinel, same honesty rule
+      // as the beacon's 0xFF byte.
+      pwCapture(3,
+                batteryPct == pw_adv::kBatteryUnknown ? INT16_MIN
+                                                      : (int16_t)batteryPct,
+                tBatt);  // BATT @ 30 s
     }
   }
   static float    egtC = NAN, cjC = NAN;
@@ -1669,6 +1920,16 @@ void loop() {
     cjC   = mcpReadColdC(mcp);
     st    = mcpReadStatus(mcp);  // 0xFF on fault (sets the TC-fault flag)
     essCj.write16((uint16_t)pw_gatt::encodeCentiC(cjC));  // ESS mirror
+    // PW capture at the Descriptor's 250 ms cadence: the 100 ms read
+    // keeps serving display/serial/beacon, and every ~2nd-3rd reading
+    // is sampled so the wire timing matches the channel table (the
+    // per-frame interval field stays authoritative regardless).
+    static uint32_t tPwEgt = 0;
+    if (pwStreamActive() && (uint32_t)(tRead - tPwEgt) >= 250) {
+      tPwEgt = tRead;
+      pwCapture(0, pw_adv::encodeDeciC(egtC), tRead);  // EGT @ 250 ms
+      pwCapture(1, pw_adv::encodeDeciC(cjC), tRead);   // CJ  @ 250 ms
+    }
     nRead++;
 
     // Runtime recovery: the soft bus's timeouts turn a wedge into an error
@@ -1723,6 +1984,11 @@ void loop() {
     tAdv = millis();
     updateAdvertising(egtC, cjC, st);
   }
+
+  // PW sample delivery: ship pending batches every pass (no-op when no
+  // subscriber; the SoftDevice coalesces notifies into connection
+  // events, so per-pass flushing costs nothing extra on the air).
+  pwFlush();
 
   if (millis() - tDraw >= DRAW_MS) {
     tDraw = millis();

@@ -16,17 +16,22 @@ A Seeed XIAO nRF52840 + Adafruit MCP9600 thermocouple amp reads a K-type
 EGT probe (plus an aux NTC thermistor for intake air and its own
 battery level) and **broadcasts** the readings in BLE advertising
 packets — protocol `PW-ADV-2` — which the logger receives with a
-passive scan that cannot interfere with its Insta360 camera link. Since
-phase 1 of the [PerchWerks Sensor Service](docs/ROADMAP.md) migration
-the egg is also **connectable**: a connection currently serves the
-standard GATT mirrors only — Device Information; Battery Service when a
-pack is present at boot; Environmental Sensing temperature for the
-intake-air thermistor and cold junction (never the EGT, which overflows
-the standard characteristic — see
-[docs/PW_SENSOR_SERVICE.md](docs/PW_SENSOR_SERVICE.md) §7). While a
-link is up the beacon pauses; it resumes on disconnect, so an unclaimed
-egg broadcasts exactly as before. A small SSD1306 OLED shows live temps
-for bench debugging (a `LINK` badge marks a live connection).
+passive scan that cannot interfere with its Insta360 camera link. The
+egg is also **connectable**, and since phases 2-3 of the
+[PerchWerks Sensor Service](docs/ROADMAP.md) migration a connection
+serves the real thing: the
+[PerchWerks Sensor Service](docs/PW_SENSOR_SERVICE.md) — a
+self-describing **Descriptor** (the pod's 4-channel table: EGT, CJ,
+intake air, battery), a **Clock** read carrying the `boot_id` epoch for
+the logger's time fit, and a **Sample** notify streaming per-channel
+batch frames stamped at acquisition — plus the standard mirrors
+(Device Information; Battery Service when a pack is present at boot;
+Environmental Sensing temperature for the intake-air thermistor and
+cold junction — never the EGT, which overflows the standard
+characteristic, spec §7). While a link is up the beacon pauses; it
+resumes on disconnect, so an unclaimed egg broadcasts exactly as
+before. A small SSD1306 OLED shows live temps for bench debugging (a
+`LINK` badge marks a live connection).
 
 ## Documentation
 

@@ -309,24 +309,34 @@ Verify 1–8 with nRF Connect alone — no PerchWerks hardware needed.
 
 Target: Adafruit Bluefruit nRF52 API as shipped in the Seeed XIAO
 nRF52840 board package (SoftDevice S140). Peripheral-side only — the
-pod needs `Bluefruit.begin(1, 0)` as today.
+pod needs `Bluefruit.begin(1, 0)` as today. (The logger's central side
+is DovesDataLogger plan 0018.)
 
 - **UUIDs:** construct `BLEUuid` from the 16-byte little-endian arrays
   of §2. One shared base costs exactly one SoftDevice vendor-UUID slot
   regardless of characteristic count.
-- **Descriptor:** `BLECharacteristic` with `CHR_PROPS_READ`,
-  `setMaxLen(512)` (variable length), value written once at init with
-  `write(buf, len)`. Long reads are served by the SoftDevice
-  automatically. A 512-byte attribute may require growing the attribute
-  table: `Bluefruit.configAttrTableSize(...)` **before** `begin()` —
-  verify at Phase 2 bring-up ([ROADMAP.md](ROADMAP.md)).
+- **Descriptor:** `BLECharacteristic` with `CHR_PROPS_READ`, value
+  written once at init with `write(buf, len)`. Long reads are served by
+  the SoftDevice automatically. `setMaxLen(512)` is the generic-pod
+  guidance; a pod whose channel table is fixed for the life of a boot
+  (the EGT pod: 104 bytes) SHOULD size the attribute at its true length.
+  *(Resolved at Phase 2 bring-up: no `configAttrTableSize` needed — the
+  Seeed core's default table is already 4096 bytes, ~3× the SoftDevice
+  default, and holds DIS+BAS+ESS+PW comfortably.)*
 - **Sample:** `CHR_PROPS_NOTIFY`, `notify(buf, len)` returns false when
   the HVN queue is full — that is the moment `seq` records a drop.
   Queue depth and MTU are `Bluefruit.configPrphConn(...)` knobs, set
-  before `begin()`; sizing them is a Phase 3 task.
-- **Clock:** easiest as a read callback (`setReadAuthorizeCallback` or
-  a just-in-time `write()` refresh) so `millis_now` is sampled at read
-  time.
+  before `begin()`. *(Phase 3 shipped `configPrphConn(247, default
+  event length, HVN queue 4, 1)`; never call `configPrphBandwidth`
+  afterwards — it silently re-applies its own preset over this.)*
+- **Clock:** `setReadAuthorizeCallback(cb, false)` so `millis_now` is
+  sampled inside the ATT transaction itself. For READ authorization
+  Bluefruit sends no reply on your behalf (unlike writes): the callback
+  MUST call `sd_ble_gatts_rw_authorize_reply` with
+  `BLE_GATTS_AUTHORIZE_TYPE_READ`, `gatt_status = SUCCESS`,
+  `update = 1` and the fresh 6-byte value, or the read stalls. Register
+  the callback before the characteristic's `begin()` so the `rd_auth`
+  attribute flag lands in the table.
 - **Advertising:** removing
   `setType(BLE_GAP_ADV_TYPE_NONCONNECTABLE_NONSCANNABLE_UNDIRECTED)`
   makes Bluefruit's default (connectable undirected) apply; the 31-byte
