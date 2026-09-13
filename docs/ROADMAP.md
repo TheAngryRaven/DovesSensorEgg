@@ -28,7 +28,7 @@
 The five documents in `docs/`, README rework, merged-branch cleanup.
 No firmware changes.
 
-## Phase 1 — connectable shell + standard mirrors (this branch)
+## Phase 1 — connectable shell + standard mirrors ✔ (merged)
 
 Make the pod connectable without changing what it broadcasts.
 
@@ -53,7 +53,7 @@ Make the pod connectable without changing what it broadcasts.
 disconnect the beacon resumes; a passive scanner sees an unchanged
 PW-ADV-2 beacon whenever the pod is unclaimed.
 
-## Phase 2 — PerchWerks service, read path
+## Phase 2 — PerchWerks service, read path ✔ (this branch)
 
 - Register service `0x5057` with Descriptor `0x5058` and Clock `0x505A`
   per spec §2/§4/§6.
@@ -70,7 +70,7 @@ against the spec table; two Clock reads a few seconds apart show
 `millis_now` advancing and a stable `boot_id`; power-cycle changes
 `boot_id`.
 
-## Phase 3 — Sample notify
+## Phase 3 — Sample notify ✔ (this branch)
 
 - Per-channel batch buffers on the existing tick cadences (EGT 250 ms,
   IAT 1 s, BATT 30 s); hardware-timer acquisition tightening comes
